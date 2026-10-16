@@ -1,4 +1,6 @@
 # Custom ignores
+# Modified by the balex42 fork: ignore release-tool Python caches.
+__pycache__/
 _test
 _out
 broken.md

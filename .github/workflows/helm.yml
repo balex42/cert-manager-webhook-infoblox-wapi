@@ -1,23 +1,43 @@
+# Modified by the balex42 fork: chart contract, readiness, and namespace/RBAC checks.
 name: Helm
 
 on:
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        default: ""
   push:
     branches: ["main"]
     paths:
       - "charts/**"
       - ".github/workflows/helm.yml"
+      - "**/*.go"
+      - "go.mod"
+      - "go.sum"
+      - "Dockerfile"
+      - "tests/**"
+      - "workflow_scripts/**"
+      - ".github/workflows/release*.yml"
   pull_request:
     branches: ["main"]
     paths:
       - "charts/**"
       - ".github/workflows/helm.yml"
+      - "**/*.go"
+      - "go.mod"
+      - "go.sum"
+      - "Dockerfile"
+      - "tests/**"
+      - "workflow_scripts/**"
+      - ".github/workflows/release*.yml"
   workflow_dispatch: # Allows manual triggering
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: helm-${{ github.workflow }}-${{ inputs.ref || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -35,6 +55,8 @@ jobs:
 
       - name: Checkout Repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Set Up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
@@ -64,6 +86,11 @@ jobs:
   lint:
     name: Lint Helm Charts
     runs-on: ubuntu-latest
+    services:
+      registry:
+        image: registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
+        ports:
+          - 5000:5000
     steps:
       - name: Harden Runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
@@ -71,31 +98,53 @@ jobs:
           disable-sudo: true
           egress-policy: block
           allowed-endpoints: >
+            127.0.0.1:5000
             api.github.com:443
             get.helm.sh:443
             github.com:443
             objects.githubusercontent.com:443
+            proxy.golang.org:443
+            raw.githubusercontent.com:443
+            release-assets.githubusercontent.com:443
+            storage.googleapis.com:443
+            sum.golang.org:443
 
       - name: Checkout Repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Install Helm
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.19.0
+
+      - name: Set Up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Check Chart Deployment Contract
+        run: go test -mod=readonly -tags=chart -run TestChartConfiguration .
+
+      - name: Test OCI Publishing and Immutable Retries
+        env:
+          OCI_TEST_REGISTRY: 127.0.0.1:5000
+        run: python3 -m unittest discover -s tests -p 'test_release*.py' -v
 
       - name: Lint Helm Charts
         run: |
           for chart in charts/*/; do
             echo "Linting $chart"
-            helm lint "$chart" --strict
+            helm lint "$chart" --strict --set infoblox.host=infoblox.example.com
           done
 
       - name: Template Helm Charts
         run: |
           for chart in charts/*/; do
             echo "Templating $chart"
-            helm template test "$chart" --debug
+            helm template test "$chart" --set infoblox.host=infoblox.example.com --debug
           done
 
   test:
@@ -115,9 +164,12 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Install Helm
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.19.0
 
       - name: Set Up Kind Cluster
         uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
@@ -147,11 +199,14 @@ jobs:
         env:
           IMAGE_TAG: ci-test
         run: |
+          kubectl create namespace webhook-test
+          kubectl create secret generic infoblox-credentials -n webhook-test \
+            --from-literal='creds.json={"username":"test-user","password":"test-password"}'
           for chart in charts/*/; do
             chart_name=$(basename "$chart")
             echo "Testing installation of $chart_name"
             
-            # Install without waiting for pod readiness (no Infoblox server available)
+            # Startup validates mounts and TLS locally; it does not require a live WAPI.
             helm install "test-$chart_name" "$chart" \
               --create-namespace \
               --namespace webhook-test \
@@ -159,21 +214,33 @@ jobs:
               --set image.repository=ghcr.io/${{ github.repository }} \
               --set image.tag=${IMAGE_TAG} \
               --set image.pullPolicy=IfNotPresent \
+              --set infoblox.host=infoblox.example.com \
               --timeout 5m \
               --debug
             
             # Wait for certificates to be issued by cert-manager
             echo "Waiting for certificates to be ready..."
-            kubectl wait --for=condition=Ready certificate --all -n webhook-test --timeout=3m || true
+            kubectl wait --for=condition=Ready certificate --all -n webhook-test --timeout=3m
+            kubectl rollout status deployment/cert-manager-webhook-infoblox-wapi -n webhook-test --timeout=3m
+            kubectl wait --for=condition=Available apiservice/v1alpha1.acme.example.com --timeout=3m
             
             # Verify resources were created
             echo "Verifying Kubernetes resources..."
             kubectl get all,certificate,issuer,secret -n webhook-test
             
-            # Check if deployment was created (don't wait for ready since no Infoblox)
-            kubectl get deployment -n webhook-test -o jsonpath='{.items[0].metadata.name}' | grep -q "cert-manager-webhook-infoblox-wapi"
-            
-            echo "✓ Helm chart installation successful (webhook pod won't be ready without Infoblox server)"
+            # Mounted credentials must not imply Kubernetes Secret-reading privileges,
+            # including for application namespaces distinct from the webhook namespace.
+            for namespace in webhook-test application-a application-b; do
+              if [ "$namespace" != webhook-test ]; then
+                kubectl create namespace "$namespace"
+              fi
+              if kubectl auth can-i get secrets/infoblox-credentials -n "$namespace" \
+                --as=system:serviceaccount:webhook-test:cert-manager-webhook-infoblox-wapi; then
+                echo "Unexpected Secret-reading permission in $namespace"
+                exit 1
+              fi
+            done
+            helm test "test-$chart_name" -n webhook-test --timeout=2m
             
             # Cleanup for next chart
             helm uninstall "test-$chart_name" -n webhook-test

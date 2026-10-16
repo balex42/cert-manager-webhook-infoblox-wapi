@@ -1,505 +1,262 @@
-<!--cspell:ignore mycompany dvcm Gracia sarg  -->
-# Cert Manager Webhook for InfoBlox WAPI
+# cert-manager Infoblox WAPI webhook
 
-[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/sarg3nt/cert-manager-webhook-infoblox-wapi/badge)](https://scorecard.dev/viewer/?uri=github.com/sarg3nt/cert-manager-webhook-infoblox-wapi)
-[![CI](https://github.com/sarg3nt/cert-manager-webhook-infoblox-wapi/actions/workflows/ci.yml/badge.svg)](https://github.com/sarg3nt/cert-manager-webhook-infoblox-wapi/actions/workflows/ci.yml)
-[![Helm](https://github.com/sarg3nt/cert-manager-webhook-infoblox-wapi/actions/workflows/helm.yml/badge.svg)](https://github.com/sarg3nt/cert-manager-webhook-infoblox-wapi/actions/workflows/helm.yml)
-[![CodeQL](https://github.com/sarg3nt/cert-manager-webhook-infoblox-wapi/actions/workflows/codeql.yml/badge.svg)](https://github.com/sarg3nt/cert-manager-webhook-infoblox-wapi/actions/workflows/codeql.yml)
-[![Trivy](https://github.com/sarg3nt/cert-manager-webhook-infoblox-wapi/actions/workflows/trivy.yml/badge.svg)](https://github.com/sarg3nt/cert-manager-webhook-infoblox-wapi/actions/workflows/trivy.yml)
-[![Scorecard Analyzer](https://github.com/sarg3nt/cert-manager-webhook-infoblox-wapi/actions/workflows/scorecard.yml/badge.svg)](https://github.com/sarg3nt/cert-manager-webhook-infoblox-wapi/actions/workflows/scorecard.yml)  
-[![Release](https://github.com/sarg3nt/cert-manager-webhook-infoblox-wapi/actions/workflows/release.yml/badge.svg)](https://github.com/sarg3nt/cert-manager-webhook-infoblox-wapi/actions/workflows/release.yml)
-[![Monthly Release](https://github.com/sarg3nt/cert-manager-webhook-infoblox-wapi/actions/workflows/release-monthly.yml/badge.svg)](https://github.com/sarg3nt/cert-manager-webhook-infoblox-wapi/actions/workflows/release-monthly.yml)
-[![Dependency Review](https://github.com/sarg3nt/cert-manager-webhook-infoblox-wapi/actions/workflows/dependency-review.yml/badge.svg)](https://github.com/sarg3nt/cert-manager-webhook-infoblox-wapi/actions/workflows/dependency-review.yml)
-[![Dependabot Updates](https://github.com/sarg3nt/cert-manager-webhook-infoblox-wapi/actions/workflows/dependabot/dependabot-updates/badge.svg)](https://github.com/sarg3nt/cert-manager-webhook-infoblox-wapi/actions/workflows/dependabot/dependabot-updates)
-****
+[![CI](https://github.com/balex42/cert-manager-webhook-infoblox-wapi/actions/workflows/ci.yml/badge.svg)](https://github.com/balex42/cert-manager-webhook-infoblox-wapi/actions/workflows/ci.yml)
+[![Helm](https://github.com/balex42/cert-manager-webhook-infoblox-wapi/actions/workflows/helm.yml/badge.svg)](https://github.com/balex42/cert-manager-webhook-infoblox-wapi/actions/workflows/helm.yml)
 
-An InfoBlox WAPI webhook for cert-manager.
+DNS-01 solver for cert-manager using Infoblox WAPI, hardened for **one shared
+Infoblox account**, mounted Kubernetes credentials, and an optional internal CA.
 
-This project provides a custom [ACME DNS01 Challenge Provider](https://cert-manager.io/docs/configuration/acme/dns01) as a webhook for [Cert Manager](https://cert-manager.io/). This webhook integrates Cert Manager with InfoBlox WAPI via its REST API. You can learn more about WAPI in this [PDF](https://www.infoblox.com/wp-content/uploads/infoblox-deployment-infoblox-rest-api.pdf).
+This fork is based on [sarg3nt/cert-manager-webhook-infoblox-wapi](https://github.com/sarg3nt/cert-manager-webhook-infoblox-wapi).
+The deployment configuration described here replaces the upstream credential and
+connection configuration. See [migration](#migration-from-upstream).
 
-This implementation is based on the [infoblox-go-client](https://github.com/infobloxopen/infoblox-go-client) library.
+## Architecture
 
-This project is a fork of https://github.com/luisico/cert-manager-webhook-infoblox-wapi, which was forked from 
-https://github.com/cert-manager/webhook-example.
+- The webhook mounts an existing Secret in its own namespace at
+  `/etc/secrets/creds.json`. Its service account does not need Secret-reading RBAC.
+- The WAPI host, port, version, and TLS policy are deployment-controlled.
+  Issuers cannot redirect the shared credentials to another endpoint.
+- TLS certificate and hostname verification default to enabled. An optional
+  ConfigMap supplies internal CA certificates **in addition to system trust**.
+  Missing or malformed configured bundles fail closed; authenticated redirects
+  are rejected. TLS 1.2 or newer is required.
+- Credentials and CA files are reread for each operation. Kubernetes projected
+  volume updates take effect after propagation, without restarting the webhook.
+- The container runs as UID/GID 65532, listens on 8443, and is exposed through a
+  Service on 443. The image uses digest-pinned Chainguard Go and Static stages.
+- `Present()` preserves existing matching records; cleanup targets the exact
+  name, value, and DNS view. Other TXT values at the same name are preserved.
 
-- [Requirements](#requirements)
-- [Installation](#installation)
-  - [Install Cert Manager](#install-cert-manager)
-  - [Install Infoblox Wapi Webhook](#install-infoblox-wapi-webhook)
-    - [Using the Public Helm Chart](#using-the-public-helm-chart)
-    - [From Source](#from-source)
-    - [Values](#values)
-  - [OpenShift](#openshift)
-  - [Infoblox User Account](#infoblox-user-account)
-    - [Kubernetes Secret](#kubernetes-secret)
-    - [Hostpath Volume Mount](#hostpath-volume-mount)
-  - [Create Issuers](#create-issuers)
-    - [Cluster Issuer for Let's Encrypt Staging using Secrets For the Infoblox Account](#cluster-issuer-for-lets-encrypt-staging-using-secrets-for-the-infoblox-account)
-    - [Cluster Issuer for Let's Encrypt Production using Volume Mount For the Infoblox Account](#cluster-issuer-for-lets-encrypt-production-using-volume-mount-for-the-infoblox-account)
-    - [Issuer for Let's Encrypt Production using Volume Mount For the Infoblox Account](#issuer-for-lets-encrypt-production-using-volume-mount-for-the-infoblox-account)
-    - [Issuer Webhook Configuration Options](#issuer-webhook-configuration-options)
-  - [Creating Certificates](#creating-certificates)
-    - [Manually](#manually)
-    - [Ingress Annotations](#ingress-annotations)
-    - [Setting Default Issuer in Let's Encrypt](#setting-default-issuer-in-lets-encrypt)
-- [Building](#building)
-- [Contributions](#contributions)
-- [License](#license)
-- [Author](#author)
+Mounted credentials are ambient credentials: the solver honors cert-manager's
+`AllowAmbientCredentials`. Use a `ClusterIssuer` with cluster-issuer ambient
+credentials enabled (cert-manager's usual default). Namespaced Issuers require
+explicitly enabling issuer ambient credentials in cert-manager. Such Issuers can
+use the shared account's DNS permissions, so grant that capability only to trusted
+Issuer administrators and scope the Infoblox account's permissions accordingly.
 
-## Requirements
-
-- InfoBlox GRID installation with WAPI 2.5 or above
-- helm v3
-- kubernetes 1.21+
-- cert-manager 1.5+
-
-> [!NOTE]
-> Other versions might work, but have not been tested.
+For API-based credential providers, cert-manager supplies an Issuer's namespace
+or the configured cluster-resource namespace for a ClusterIssuer. A ClusterIssuer
+does not inherently require copying credentials into application namespaces.
+This fork's mounted-account design is independent of that namespace selection.
 
 ## Installation
 
-There are three steps needed to make this work.
+Install cert-manager first. Choose a unique webhook API group that you control,
+such as `acme.example.com`. The same value must appear in Helm and Issuer settings.
 
-1. [Install Cert Manager](#install-cert-manager)
-2. [Install Infoblox Wapi Webhook](#install-infoblox-wapi-webhook) (this plugin)
-3. [Create Issuers](#create-issuers)
+### 1. Create credentials
 
-### Install Cert Manager
+Create a protected local `creds.json` file with ordinary JSON strings:
 
-Follow the [instructions](https://cert-manager.io/docs/installation/) to install Cert Manager.
-
-### Install Infoblox Wapi Webhook
-
-At a minimum you will need to customize `groupName` with your own group name. See [charts/cert-manager-webhook-infoblox-wapi/values.yaml](./charts/cert-manager-webhook-infoblox-wapi/values.yaml) for an in-depth explanation and other values that might require tweaking. With either method below, follow [helm instructions](https://helm.sh/docs/intro/using_helm/#customizing-the-chart-before-installing) to customize your deployment.
-
-Docker images are stored in GitHub's [ghcr.io](https://ghcr.io) registry, specifically at [ghcr.io/sarg3nt/cert-manager-webhook-infoblox-wapi](https://ghcr.io/sarg3nt/cert-manager-webhook-infoblox-wapi).
-
-#### Using the Public Helm Chart
-
-```sh
-helm repo add cert-manager-webhook-infoblox-wapi https://sarg3nt.github.io/cert-manager-webhook-infoblox-wapi
-
-# The values file below is optional, if you don't need it you can remove that line.
-helm -n cert-manager install \
-  cert-manager-webhook \
-  cert-manager-webhook-infoblox-wapi/cert-manager-webhook-infoblox-wapi \
-  -f cert-manager-infoblox-values.yaml
-```
-
-#### From Source
-
-Check out this repository and run the following command:
-
-```sh
-helm -n cert-manager install webhook-infoblox-wapi deploy/cert-manager-webhook-infoblox-wapi
-```
-
-#### Values
-| Name                           | Description                                                                                                                                                                                                                                                                                                                                                                       | Value                                              |
-|--------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------|
-| nameOverride                   | String to partially override chart name.                                                                                                                                                                                                                                                                                                                                          | ""                                                 |
-| fullNameOverride               | String to fully override chart fullname.                                                                                                                                                                                                                                                                                                                                          | ""                                                 |
-| groupName                      | The GroupName here is used to identify your company or business unit that created this webhook. This name will need to be referenced in each Issuer's `webhook` stanza to inform cert-manager of where to send ChallengePayload resources in order to solve the DNS01 challenge. This group name should be **unique**, hence using your own company's domain here is recommended. | acme.mycompany.com                                 |
-| certManager.namespace          | Namespace where cert-manager is deployed.                                                                                                                                                                                                                                                                                                                                         | cert-manager                                       |
-| certManager.serviceAccountName | Service account name of cert-manager.                                                                                                                                                                                                                                                                                                                                             | cert-manager                                       |
-| rootCACertificate.duration     | Duration of root CA certificate                                                                                                                                                                                                                                                                                                                                                   | 43800h                                             |
-| servingCertificate.duration    | Duration of serving certificate                                                                                                                                                                                                                                                                                                                                                   | 8760h                                              |
-| image.repository               | Deployment image repository                                                                                                                                                                                                                                                                                                                                                       | ghcr.io/sarg3nt/cert-manager-webhook-infoblox-wapi |
-| image.tag                      | Deployment image tag                                                                                                                                                                                                                                                                                                                                                              | 1.5                                                |
-| image.pullPolicy               | Image pull policy                                                                                                                                                                                                                                                                                                                                                                 | IfNotPresent                                       |
-| secretVolume.hostPath          | Location of a secrets file on the host file system to use instead of a Kubernetes secret                                                                                                                                                                                                                                                                                          | /etc/secrets/secrets.json                          |
-| service.type                   | Service type to expose                                                                                                                                                                                                                                                                                                                                                            | ClusterIP                                          |
-| service.port                   | Service port to expose                                                                                                                                                                                                                                                                                                                                                            | 443                                                |
-| podAnnotations                 | Annotations to add to the pod                                                                                                                                                                                                                                                                                                                                                     | {}                                                 |
-| podSecurityContext             | Pod-level security context. Override or set to `{}` to disable (e.g. for OpenShift). See [OpenShift](#openshift).                                                                                                                                                                                                                                                                | see values.yaml                                    |
-| containerSecurityContext       | Container-level security context. Override or set to `{}` to disable.                                                                                                                                                                                                                                                                                                            | see values.yaml                                    |
-| resources                      | Deployment resource limits                                                                                                                                                                                                                                                                                                                                                        | {}                                                 |
-| nodeSelector                   | Deployment node selector object                                                                                                                                                                                                                                                                                                                                                   | {}                                                 |
-| tolerations                    | Deployment tolerations                                                                                                                                                                                                                                                                                                                                                            | []                                                 |
-| affinity                       | Deployment affinity                                                                                                                                                                                                                                                                                                                                                               | {}                                                 |
-
-### OpenShift
-
-On OpenShift, pod UIDs are automatically assigned from the namespace's UID range, so the hardcoded `runAsUser`, `runAsGroup`, and `fsGroup` values in the default `podSecurityContext` will conflict with the namespace's Security Context Constraints (SCC). Additionally, `seccompProfile` may not be supported depending on the SCC in use.
-
-To deploy on OpenShift, override `podSecurityContext` in your values file to null out the fields that OpenShift manages:
-
-```yaml
-podSecurityContext:
-  runAsNonRoot: true
-  runAsUser: null
-  runAsGroup: null
-  fsGroup: null
-  seccompProfile: null
-```
-
-If you prefer to disable the pod-level security context entirely and rely solely on the SCC:
-
-```yaml
-podSecurityContext: null
-```
-
-> [!NOTE]
-> Setting `podSecurityContext: {}` (empty map) will not disable the security context — Helm merges empty maps with the chart defaults, leaving all fields in place. You must use `null` to remove individual fields or the whole object.
-
-The default `containerSecurityContext` (`allowPrivilegeEscalation: false`, `readOnlyRootFilesystem: true`, `capabilities.drop: [ALL]`) is compatible with OpenShift's built-in `restricted-v2` SCC and does not normally need to be changed. If you are using a more permissive SCC and prefer no container-level restrictions, set:
-
-```yaml
-containerSecurityContext: null
-```
-
-### Infoblox User Account
-
-A user account with the ability to create TXT records in the required domain is needed.  
-We support two ways of loading this service account.
-
-#### Kubernetes Secret
-
-The first method is to create a Kubernetes secret that include the Infoblox users `username` and `password`.
-
-```yaml
-apiVersion: v1
-kind: Secret
-metadata:
-  name: infoblox-credentials
-  namespace: cert-manager
-type: Opaque
-data:
-  username: dXNlcm5hbWUK      # base64 encoded: "username"
-  password: cGFzc3dvcmQK      # base64 encoded: "password"
-
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: webhook-infoblox-wapi:secret-reader
-  namespace: cert-manager
-rules:
-  - apiGroups: [""]
-    resources:
-      - secrets
-    resourceNames:
-      - infoblox-credentials
-    verbs:
-      - get
-      - watch
-
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: webhook-infoblox-wapi:secret-reader
-  namespace: cert-manager
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: webhook-infoblox-wapi:secret-reader
-subjects:
-  - apiGroup: ""
-    kind: ServiceAccount
-    name: cert-manager-webhook-cert-manager-webhook-infoblox-wapi
-    namespace: cert-manager
-```
-
-Then create a `ClusterIssuer` with the following in the `config` section.  
-See [Issuer Examples](#issuer-examples)
-
-```yaml
-usernameSecretRef:
-  name: infoblox-credentials
-  key: username
-passwordSecretRef:
-  name: infoblox-credentials
-  key: password
-```
-
-#### Hostpath Volume Mount
-
-The second method is to create a file on the hosts file system that contains the `username` and `password`.  
-This file must be created in the path given in `secretVolume.hostPath` in the Helm chart's `values.yaml` file.  Default location is `/etc/secrets/secrets.json`.
-
-**Example:**
-The values must be base64 encoded.
 ```json
-{
-  "username": "dXNlcm5hbWUK",
-  "password": "cGFzc3dvcmQK"
-}
+{"username":"cert-manager-service-account","password":"replace-me"}
 ```
 
-Then create a `ClusterIssuer` with the following in the `config` section.  
-See [Create Issuers](#create-issuers)
+Do not base64-encode the individual JSON values. Kubernetes handles Secret data
+encoding. Create the namespace and Secret using your usual secret-management
+process, or:
+
+```sh
+kubectl create namespace infoblox-webhook
+kubectl -n infoblox-webhook create secret generic infoblox-credentials \
+  --from-file=creds.json=/secure/path/creds.json
+```
+
+The chart references this Secret; it does not put credentials into Helm values.
+
+### 2. Supply your internal CA
+
+For a private-PKI WAPI endpoint, put the issuing CA chain in a PEM bundle:
+
+```sh
+kubectl -n infoblox-webhook create configmap infoblox-ca \
+  --from-file=ca.crt=/secure/path/infoblox-ca-chain.pem
+```
+
+The WAPI server must present a certificate valid for the configured hostname.
+The webhook's Kubernetes serving certificate is separate and is managed by the
+chart's cert-manager Certificate resources.
+
+### 3. Configure Helm
+
+Create `values-production.yaml`:
 
 ```yaml
-getUserFromVolume: true
+groupName: acme.example.com
+infoblox:
+  host: infoblox.example.com
+  port: 443
+  version: "2.10" # Choose a version supported by your GRID.
+  credentials:
+    existingSecret: infoblox-credentials
+    key: creds.json
+  tls:
+    verify: true
+    caBundle:
+      existingConfigMap: infoblox-ca
+      key: ca.crt
+image:
+  # Published OCI charts already pin their corresponding image digest.
+  # Override repository/digest only when deploying your own build.
+  pullPolicy: IfNotPresent
 ```
 
-### Create Issuers
+For a publicly trusted WAPI certificate, omit `caBundle.existingConfigMap`.
+Choose a published fork chart version, then install it directly from GHCR:
 
-An issuer is the method that Cert Manager will use to request a certificate and the configuration Let's Encrypt will use to validate that the requester (you) owns the domain the certificate request is for.
+```sh
+export CHART_VERSION=X.Y.Z # Replace with an actual published chart version.
+helm upgrade --install infoblox-webhook \
+  oci://ghcr.io/balex42/charts/cert-manager-webhook-infoblox-wapi \
+  --version "$CHART_VERSION" \
+  --namespace infoblox-webhook \
+  --values values-production.yaml \
+  --wait --timeout 5m
+kubectl wait --for=condition=Available \
+  apiservice/v1alpha1.acme.example.com --timeout=3m
+```
 
-The part of an issuer that defines the use of this webhook plugin starts in the `webhook` section as shown in the examples below.
+The public chart package is
+`ghcr.io/balex42/charts/cert-manager-webhook-infoblox-wapi`. OCI installation does
+not require `helm repo add`. A published chart contains its release image digest;
+the source chart uses appVersion/tag until packaged by the release workflow.
 
-All settings under `config` are specific to this plugin.  See the list of [Issuer Webhook Configuration Options](#issuer-webhook-configuration-options) below.
+For local development, install `./charts/cert-manager-webhook-infoblox-wapi` and
+explicitly set the image repository and digest (or tag) for the image you built.
 
-See: [Cert Manager Issuers](https://cert-manager.io/docs/concepts/issuer/) in the official Cert Manager documentation for more information.
+### 4. Create a ClusterIssuer
 
-There are two different kinds of issuers:
-- `Issuer` is for a specific namespace.
-- `ClusterIssuer` is for an entire cluster and is most often used.
-
-#### Cluster Issuer for Let's Encrypt Staging using Secrets For the Infoblox Account
-
-```yaml 
+```yaml
 apiVersion: cert-manager.io/v1
 kind: ClusterIssuer
 metadata:
   name: letsencrypt-staging
 spec:
   acme:
-    # The email matching the account that your Lets Encrypt account key was created in.
-    email: your.email@example.com
-    # What Lets Encrypt server to use. This one is for staging certificates during development.
+    email: admin@example.com
     server: https://acme-staging-v02.api.letsencrypt.org/directory
     privateKeySecretRef:
-      name: letsencrypt-account-key
+      name: letsencrypt-staging-account
     solvers:
-    - dns01:
-        webhook:
-          # groupName must match the groupName you set while installing this plugin via the Helm chart.
-          groupName: acme.mycompany.com
-          solverName: infoblox-wapi
-          config:
-            host: my-infoblox.company.com # required
-            view: "InfoBlox View" # required
-            usernameSecretRef:
-              name: infoblox-credentials
-              key: username
-            passwordSecretRef:
-              name: infoblox-credentials
-              key: password
+      - dns01:
+          webhook:
+            groupName: acme.example.com
+            solverName: infoblox-wapi
+            config:
+              view: External
+              ttl: 300
+              useTtl: true
 ```
 
-#### Cluster Issuer for Let's Encrypt Production using Volume Mount For the Infoblox Account
+Only `view`, `ttl`, and `useTtl` are accepted in solver config. `view` is required;
+TTL defaults to 300 seconds and `useTtl` defaults to true. Explicit false is
+preserved. TTL zero uses the default.
 
-```yaml 
-apiVersion: cert-manager.io/v1
-kind: ClusterIssuer
-metadata:
-  name: letsencrypt-production
-spec:
-  acme:
-    email: your.email@example.com
-    server: https://acme-v02.api.letsencrypt.org/directory
-    privateKeySecretRef:
-      name: letsencrypt-account-key
-    solvers:
-    - dns01:
-        webhook:
-          groupName: acme.mycompany.com
-          solverName: infoblox-wapi
-          config:
-            host: my-infoblox.company.com
-            view: "InfoBlox View"
-            getUserFromVolume: true
-```
-#### Issuer for Let's Encrypt Production using Volume Mount For the Infoblox Account
+Certificates in different application namespaces can reference this ClusterIssuer.
+Choose the DNS view that serves the challenge records. cert-manager's DNS self-check
+and the ACME server must both be able to resolve them. For split-horizon setups,
+check authoritative visibility and cert-manager's recursive DNS configuration.
 
-```yaml 
-apiVersion: cert-manager.io/v1
-kind: Issuer
-metadata:
-  name: letsencrypt-production
-  namespace: mesh-system
-spec:
-  acme:
-    email: your.email@example.com
-    server: https://acme-v02.api.letsencrypt.org/directory
-    privateKeySecretRef:
-      name: letsencrypt-account-key
-    solvers:
-    - dns01:
-        webhook:
-          groupName: acme.mycompany.com
-          solverName: infoblox-wapi
-          config:
-            host: my-infoblox.company.com
-            view: "InfoBlox View"
-            getUserFromVolume: true
-```
-> [!NOTE] 
-> You can create more than one `ClusterIssuer`.  For example, one for Let's Encrypt staging and one for Let's Encrypt production.  You can then reference which one you want to use when creating a cert or annotating an ingress.  See below for examples.
+## Helm settings
 
-#### Issuer Webhook Configuration Options
+See [values.yaml](charts/cert-manager-webhook-infoblox-wapi/values.yaml) and its
+JSON schema for the complete chart settings. Important values:
 
-This is the full list of webhook configuration options:
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `infoblox.host` | Required | WAPI hostname or IPv4 address, without scheme/port/path |
+| `infoblox.port` | `443` | WAPI HTTPS port |
+| `infoblox.version` | `"2.10"` | WAPI API version |
+| `infoblox.credentials.existingSecret` | `infoblox-credentials` | Secret in release namespace |
+| `infoblox.credentials.key` | `creds.json` | Secret key mapped to the fixed credentials path |
+| `infoblox.tls.verify` | `true` | Certificate and hostname verification |
+| `infoblox.tls.caBundle.existingConfigMap` | Empty | Optional internal CA ConfigMap |
+| `infoblox.tls.caBundle.key` | `ca.crt` | ConfigMap key mapped to the fixed CA path |
+| `infoblox.httpRequestTimeout` | `60` | Per-request timeout in seconds |
+| `infoblox.httpPoolConnections` | `10` | Maximum idle connections per WAPI host |
+| `securePort` | `8443` | Non-privileged webhook listener |
+| `service.port` | `443` | Kubernetes Service port |
+| `image.digest` | Empty | Immutable image digest, taking precedence over tag |
+| `networkPolicy.enabled` | `false` | Enable explicit network restrictions |
 
-- `groupName`: This must match the `groupName` you specified in the Helm chart config during install.
-- `host`: FQDN or IP address of the InfoBlox server.
-- `view`: DNS View in the InfoBlox server to manipulate TXT records in.
-- `usernameSecretRef`: Reference to the secret name holding the username for the InfoBlox server (optional if getUserFromVolume is true)
-- `passwordSecretRef`: Reference to the secret name holding the password for the InfoBlox server (optional if getUserFromVolume is true)
-- `getUserFromVolume: true`: Get the Infoblox user from the host file system. (default: false)
-- `port`: Port of the InfoBlox server (default: 443).
-- `version`: Version of the InfoBlox server (default: 2.10).
-- `sslVerify`: Verify SSL connection (default: false).
-- `httpRequestTimeout`: Timeout for HTTP request to the InfoBlox server, in seconds (default: 60).
-- `httpPoolConnections`: Maximum number of connections to the InfoBlox server (default: 10).
-- `ttl`: The time to live of the TXT record. (default: 90)
-- `useTtl`: Whether or not to use the ttl.  (default: true)
+`infoblox.tls.verify: false` is an explicit deployment-level opt-out. It cannot
+be combined with a configured CA bundle. Trusting the internal CA is preferred.
 
-### Creating Certificates
+### NetworkPolicy
 
-You can create certificates either manually or via Ingress Annotations.
+When enabled, configure `networkPolicy.ingressPeers` for API-server traffic and
+`networkPolicy.egressRules` for WAPI and Kubernetes API destinations. These are
+required: API servers may be external or host-networked and cannot reliably be
+identified by namespace selectors. Account for your CNI's Service NAT behavior.
 
-#### Manually
+`networkPolicy.dnsPeers` defaults to kube-dns-labeled pods in `kube-system` on
+TCP/UDP 53. Adjust it for NodeLocal DNS or other resolver deployments. See
+[tests/chart-values.yaml](tests/chart-values.yaml) for the configuration shape;
+its IPs are documentation examples.
 
-Now you can create a certificate, for example:
+## Migration from upstream
 
-```yaml
-apiVersion: cert-manager.io/v1
-kind: Certificate
-metadata:
-  name: infoblox-wapi-test
-  namespace: cert-manager
-spec:
-  commonName: example.com
-  dnsNames:
-    - example.com
-  issuerRef:
-    # The name of the issuer created above.
-    name: letsencrypt-production
-    kind: ClusterIssuer
-  secretName: infoblox-wapi-test-tls
+This is a breaking configuration change:
+
+1. Convert credential references or a node-local file into an existing Secret
+   containing a JSON `creds.json` object in the webhook namespace.
+2. Replace `secretVolume.hostPath` with `infoblox.credentials.existingSecret`.
+3. Move host, port, WAPI version, HTTP options, and TLS settings from solver config
+   into Helm's `infoblox` settings. Remove `usernameSecretRef`,
+   `passwordSecretRef`, `getUserFromVolume`, and `sslVerify` from solver config.
+4. Keep only DNS view and TTL settings in the Issuer. Unknown keys are rejected.
+5. Supply the internal CA bundle before enabling verification against private PKI.
+6. Use an authorized ClusterIssuer and check ambient-credential configuration.
+7. Roll out the new chart and fork image together. Verify the APIService and a
+   staging issuance before switching production certificates.
+
+The chart retains upstream's release version until the next versioned release;
+the existing version does not imply an image containing these changes is published.
+
+## Development and verification
+
+```sh
+make test
+make test-race
+go vet ./...
+helm lint charts/cert-manager-webhook-infoblox-wapi \
+  --set infoblox.host=infoblox.example.com --strict
+go test -tags=chart -run TestChartConfiguration .
+python3 -m unittest discover -s tests -p 'test_release*.py' -v
 ```
 
-#### Ingress Annotations
+Tests exercise the real Infoblox connector against a local HTTPS WAPI stub. They
+cover concurrent TXT values, retry idempotency, cleanup isolation, credential
+rotation, TLS trust, hostname verification, and response redaction. Chart tests
+check mounts, ports, immutable images, private CAs, and invalid configurations.
 
-If you are using Nginx Ingress you can add an annotation and Let's Encrypt will automatically create a certificate for you.  
-See: [Cert Manager Annotated Ingress resource](https://cert-manager.io/docs/usage/ingress/)
+The Helm workflow installs the chart in Kind, waits for the webhook and APIService,
+and checks that its service account cannot read credentials Secrets in the webhook
+or application namespaces. Live provider conformance and actual multi-namespace
+issuance still require a configured Infoblox and ACME environment; see
+[docs/TESTING.md](docs/TESTING.md).
 
-```yaml
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  annotations:
-    # Use the default issuer: 
-    kubernetes.io/tls-acme: "true"
-    # OR Use a specific issuer:
-    cert-manager.io/cluster-issuer: letsencrypt-staging
-# Rest of normal ingress config goes here.
-```
+## Images, releases, and licensing
 
-> [!NOTE] 
-> To use `kubernetes.io/tls-acme: "true"`, a `defaultIssuerName` must be set.  
-> See: [Setting Default Issuer in Let's Encrypt](#setting-default-issuer-in-lets-encrypt)
+The release workflow validates the tagged revision through CI and Kind tests,
+then builds `linux/amd64` and `linux/arm64` images with SBOM/provenance attestations.
+It signs the image digest, uploads a Trivy vulnerability/license report, and
+publishes a separate OCI Helm chart pinned to that digest. The chart is pulled
+back, compared with the release package, rendered, and signed by its OCI digest.
+Retries reuse matching existing artifacts and reject conflicting versions. See
+[workflow setup](.github/workflows/README.md) for publishing credentials and
+verification commands. Dependency metadata and the final SBOM should be reviewed
+when distributing images; compiled Go dependencies retain their own licenses.
 
-#### Setting Default Issuer in Let's Encrypt
+The project is Apache-2.0 licensed. Preserve [LICENSE](LICENSE), [NOTICE](NOTICE),
+and applicable attributions. Both files are included under `/licenses` in the image.
+Chainguard base packages retain their respective licenses and distribution terms.
 
-When deploying the Let's Encrypt Helm chart you can set a default issuer with the following config.
+### Attribution
 
-```yaml
-ingressShim:
-  defaultIssuerName: "letsencrypt-production"
-```
-
-Once this is done you can then use the `kubernetes.io/tls-acme: "true"` annotation and the default issuer will be used.
-
-<!-- ## Running the test suite
-
-Requirements:
-
-- go >= 1.21
-
-First create you own `config.json` and `credentials.yaml` inside `testdata/infoblox-wapi/` based on the corresponding `.sample` files. The values in `config.json` correspond to the webhook `config` section in the example `ClusterIssuer` above, while `credentials.yaml` will create a secret. Ensure that you fill in the values for the test to connect to an InfoBlox instance.
-
-You can then run the test suite with:
-
-```bash
-TEST_ZONE_NAME=example.com. make test
-``` -->
-
-## Building
-
-1. If you've made any changes to `go.mod`, run `go mod tidy`
-1. Update the `Makefile` with a new `IMAGE_TAG` if necessary.
-1. Run `make build`.  This will use `go` to build the project.
-1. Run `make build-container`.  A new Docker container will be generated and tagged as:  
-   `$(IMAGE_NAME):$(IMAGE_TAG)-$(GIT_BRANCH)` as given in the `Makefile`
-1. Run `make push-container`. This will push the above tagged image to the repo defined in the `IMAGE_NAME`
-
-## Contributions
-
-We welcome contributions to this project! Please follow these guidelines:
-
-### Commit Message Convention
-
-This project uses [Conventional Commits](https://www.conventionalcommits.org/) for automated semantic versioning and changelog generation. All commits should follow this format:
-
-```
-<type>[optional scope]: <description>
-
-[optional body]
-
-[optional footer(s)]
-```
-
-**Commit Types:**
-- `feat:` - A new feature (triggers **minor** version bump)
-- `fix:` - A bug fix (triggers **patch** version bump)
-- `docs:` - Documentation only changes
-- `style:` - Code style changes (formatting, missing semi-colons, etc.)
-- `refactor:` - Code changes that neither fix a bug nor add a feature
-- `perf:` - Performance improvements
-- `test:` - Adding or updating tests
-- `chore:` - Maintenance tasks, dependency updates
-- `ci:` - CI/CD configuration changes
-- `build:` - Build system or external dependency changes
-- `revert:` - Reverting a previous commit
-
-**Breaking Changes:**
-- Add `!` after the type (e.g., `feat!:`) or include `BREAKING CHANGE:` in the footer to trigger a **major** version bump
-
-**Examples:**
-```bash
-feat: add support for custom DNS zones
-fix: resolve timeout issue in webhook validation
-docs: improve installation instructions
-chore: update Go dependencies to 1.25.5
-feat!: change API endpoint structure
-fix(helm): correct service port configuration
-```
-
-### Release Process
-
-This project uses [Release Please](https://github.com/googleapis/release-please) for automated releases:
-
-1. When commits are pushed to `main`, Release Please analyzes commit messages
-2. It creates/updates a "Release PR" with the changelog and version bump
-3. When the Release PR is merged, it automatically:
-   - Creates a GitHub release with the changelog
-   - Creates a git tag
-   - Triggers the Docker image build and push
-   - Updates the Helm chart version
-
-### Pull Request Guidelines
-
-- PR titles should also follow the Conventional Commits format
-- Keep changes focused and atomic
-- Update documentation as needed
-- Ensure all CI checks pass
-
-For more details, see [.github/commit-instructions.md](.github/commit-instructions.md).
-
-## License
-
-This project inherits the Apache 2.0 license from https://github.com/cert-manager/webhook-example.
-
-Modifications to files are listed in [NOTICE](./NOTICE).
-
-## Author
-
-Luis Gracia while at [The Rockefeller University](http://www.rockefeller.edu), taken over by Dave Sargent:
-- dave [at] sarg3.net
-- GitHub at [sarg3nt](https://github.com/sarg3nt)
+Originally developed by Luis Gracia while at The Rockefeller University, based on
+[cert-manager/webhook-example](https://github.com/cert-manager/webhook-example),
+then maintained and extended by [Dave Sargent](https://github.com/sarg3nt).
+Shared-account, TLS, deployment, test, and image hardening modifications are by
+the [balex42 fork](https://github.com/balex42/cert-manager-webhook-infoblox-wapi).
+Historical changes and attribution remain in [CHANGELOG.md](CHANGELOG.md) and NOTICE.

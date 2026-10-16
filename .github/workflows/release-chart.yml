@@ -1,64 +1,94 @@
-name: Release Chart
+# Modified by the balex42 fork: native Helm OCI publishing, after the signed image.
+name: Release OCI Chart
 
-# Publishes the Helm chart to the gh-pages branch using the canonical
-# chart-releaser pattern: run on every push to main that changes charts/**.
-# chart-releaser diffs each chart's version against existing GitHub releases and
-# only publishes versions that don't yet have a release, so this is naturally
-# idempotent. This replaces the previous `pull_request: closed` trigger, which
-# fired on ANY PR close -- merged or not -- and published charts from unmerged
-# branches (it once shipped a broken 3.0.1 chart from a closed release PR).
 on:
-  push:
-    branches: ["main"]
-    paths:
-      - "charts/**"
-  workflow_dispatch: # Allows manual triggering
+  workflow_call:
+    inputs:
+      ref:
+        required: true
+        type: string
+      version:
+        required: true
+        type: string
+      image:
+        required: true
+        type: string
+      image-digest:
+        required: true
+        type: string
+      chart-parent:
+        required: true
+        type: string
 
 permissions:
   contents: read
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false # Don't cancel chart deployments
+  packages: write
+  id-token: write
 
 jobs:
-  release-chart:
-    name: Release Chart
+  publish:
+    name: Package, Publish, Verify, and Sign Chart
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pull-requests: write
-
+    timeout-minutes: 15
+    env:
+      REGISTRY_USERNAME: ${{ github.actor }}
+      REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
     steps:
-    - name: Harden Runner
-      uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
-      with:
-        disable-sudo: true
-        egress-policy: audit
-
-    - name: Checkout
-      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      with:
-        fetch-depth: 0
-        fetch-tags: true
-
-    - name: Configure Git
-      run: |
-        git config user.name "$GITHUB_ACTOR"
-        git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
-
-    - name: Install Helm
-      uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
-      env:
-        GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
-
-    # This will release the chart to the gh-pages branch. `skip_existing` makes
-    # re-runs safe: if a chart's release/tag already exists it is skipped instead
-    # of failing the job.
-    - name: Run Chart-Releaser
-      uses: helm/chart-releaser-action@cae68fefc6b5f367a0275617c9f83181ba54714f # v1.7.0
-      with: 
-        mark_as_latest: false
-        skip_existing: true
-      env:
-        CR_TOKEN: "${{ secrets.USER_PAT }}"
+      - name: Harden Runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          disable-sudo: true
+          egress-policy: audit
+      - name: Checkout Validated Revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Install Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.19.0
+      - name: Log Into GHCR
+        run: |
+          # Helm and Cosign share Docker-compatible registry authentication.
+          export DOCKER_CONFIG="$RUNNER_TEMP/chart-registry"
+          export HELM_REGISTRY_CONFIG="$DOCKER_CONFIG/config.json"
+          echo "DOCKER_CONFIG=$DOCKER_CONFIG" >> "$GITHUB_ENV"
+          echo "HELM_REGISTRY_CONFIG=$HELM_REGISTRY_CONFIG" >> "$GITHUB_ENV"
+          printf '%s' "$REGISTRY_PASSWORD" | helm registry login ghcr.io \
+            --username "$REGISTRY_USERNAME" --password-stdin
+      - name: Publish and Pull Back Immutable Chart
+        id: chart
+        env:
+          CHART_PARENT: ${{ inputs.chart-parent }}
+          VERSION: ${{ inputs.version }}
+          IMAGE: ${{ inputs.image }}
+          IMAGE_DIGEST: ${{ inputs.image-digest }}
+        run: |
+          python3 workflow_scripts/release.py chart \
+            --repository "${CHART_PARENT}/cert-manager-webhook-infoblox-wapi" \
+            --version "$VERSION" --image "$IMAGE" --digest "$IMAGE_DIGEST"
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad # v4.0.0
+      - name: Sign Chart Digest
+        env:
+          CHART: ${{ steps.chart.outputs.chart }}
+          DIGEST: ${{ steps.chart.outputs.digest }}
+        run: cosign sign --yes "${CHART#oci://}@${DIGEST}"
+      - name: Write Release Summary
+        env:
+          CHART: ${{ steps.chart.outputs.chart }}
+          CHART_DIGEST: ${{ steps.chart.outputs.digest }}
+          IMAGE: ${{ inputs.image }}
+          IMAGE_DIGEST: ${{ inputs.image-digest }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          {
+            echo '## Published release'
+            echo "- Image: \`${IMAGE}@${IMAGE_DIGEST}\`"
+            echo "- Chart: \`${CHART}@${CHART_DIGEST}\`"
+            echo "- Version: \`${VERSION}\`"
+            echo ''
+            echo '```sh'
+            echo "helm upgrade --install infoblox-webhook ${CHART} --version ${VERSION} --namespace infoblox-webhook --create-namespace --values values-production.yaml"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

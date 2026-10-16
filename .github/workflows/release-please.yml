@@ -1,3 +1,4 @@
+# Modified by the balex42 fork: one version source for the image and OCI chart.
 name: Release Please
 
 on:
@@ -32,6 +33,15 @@ jobs:
           disable-sudo: true
           egress-policy: audit
 
+      - name: Check Release Automation Token
+        env:
+          RELEASE_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          if [ -z "$RELEASE_TOKEN" ]; then
+            echo 'Configure GH_TOKEN so release PRs and tags can trigger downstream workflows.'
+            exit 1
+          fi
+
       - name: Run Release Please
         id: release
         uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
@@ -61,8 +71,5 @@ jobs:
           echo "Version: ${{ steps.release.outputs['.--version'] }}"
           echo "Release PR: ${{ steps.release.outputs.pr }}"
 
-  # Note: Your existing release.yml workflow will automatically trigger
-  # when the release tag is created by release-please, so no additional
-  # trigger is needed here. The release.yml workflow handles:
-  # - Building and pushing Docker images
-  # - Creating Helm chart update PRs
+  # Tags created with GH_TOKEN trigger release.yml, which validates the tagged
+  # revision and publishes both the image and its digest-pinned OCI chart.

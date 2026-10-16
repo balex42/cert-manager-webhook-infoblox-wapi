@@ -58,4 +58,50 @@ Files modified by Dave Sargent (dave@sarg3.net)
  Makefile
  NOTICE
  README.md
- SECURITY.md
+  SECURITY.md
+
+Modifications by the balex42 fork (https://github.com/balex42/cert-manager-webhook-infoblox-wapi), 2026:
+ Shared mounted credentials, deployment-controlled WAPI endpoint and TLS settings,
+ verified internal-CA transport, DNS retry/cleanup hardening, regression tests,
+ non-root Helm serving, Chainguard images, fork publishing and supply-chain metadata.
+ Files modified:
+  main.go
+  main_test.go
+  main_unit_test.go
+  go.mod
+  Dockerfile
+  Makefile
+  .mise.toml
+  README.md
+  docs/TESTING.md
+  .github/CODEOWNERS
+  .github/workflows/README.md
+  .github/workflows/ci.yml
+  .github/workflows/helm.yml
+  .github/workflows/release.yml
+  .github/workflows/release-monthly.yml
+  .github/workflows/release-chart.yml
+  .github/workflows/trivy.yml
+  charts/cert-manager-webhook-infoblox-wapi/Chart.yaml
+  charts/cert-manager-webhook-infoblox-wapi/values.yaml
+  charts/cert-manager-webhook-infoblox-wapi/values.schema.json
+  charts/cert-manager-webhook-infoblox-wapi/templates/deployment.yaml
+  charts/cert-manager-webhook-infoblox-wapi/templates/networkpolicy.yaml
+  charts/cert-manager-webhook-infoblox-wapi/templates/NOTES.txt
+  testdata/infoblox-wapi/config.json.sample
+  testdata/infoblox-wapi/credentials.yaml.sample
+ Files added:
+  transport.go
+  transport_test.go
+  chart_test.go
+  tests/chart-values.yaml
+  .dockerignore
+
+ Additional OCI release changes by the balex42 fork:
+  Reworked release.yml, release-chart.yml, release-monthly.yml, release-please.yml,
+  ci.yml, and helm.yml for one validated image/chart release flow and native OCI.
+  Updated .gitignore, README.md, docs/TESTING.md, workflow documentation, and Chart.yaml.
+  Added workflow_scripts/oci_registry.py, workflow_scripts/release.py,
+  tests/test_release.py, and .release-refresh.
+  Retired workflow_scripts/compare_containers.sh, get_latest_version.sh,
+  and sync_release_please_version.sh; monthly refreshes now use Release Please.

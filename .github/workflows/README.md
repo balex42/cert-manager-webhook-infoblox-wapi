@@ -1,161 +1,120 @@
-# GitHub Actions Workflows
+# Fork CI and OCI releases
 
-This directory contains all GitHub Actions workflows for the cert-manager-webhook-infoblox-wapi project.
+Modified for `balex42/cert-manager-webhook-infoblox-wapi`.
 
-## Workflows Overview
+## Artifact locations
 
-### CI/CD Workflows
+| Artifact | GHCR package |
+| --- | --- |
+| Multi-platform image | `ghcr.io/balex42/cert-manager-webhook-infoblox-wapi` |
+| Helm OCI chart | `oci://ghcr.io/balex42/charts/cert-manager-webhook-infoblox-wapi` |
 
-#### [ci.yml](ci.yml)
-**Purpose:** Continuous Integration for Go code  
-**Triggers:** Push to main, Pull Requests  
-**Jobs:**
-- **Lint:** Runs golangci-lint, go vet, gofmt, and go mod verification
-- **Test:** Executes unit tests with race detector and generates coverage reports
-- **Build:** Builds Docker image to verify build process
+## Release flow
 
-**Secrets Required:** None (uses `GITHUB_TOKEN`)
+1. `release-please.yml` opens a release PR and updates the release manifest,
+   chart version, and appVersion together.
+2. Merging that PR creates a `vX.Y.Z` tag. `release.yml` checks the tag's exact
+   commit and rejects mismatches between tag, chart version, and appVersion.
+3. Reusable `ci.yml` and `helm.yml` validate that same commit, including Kind
+   APIService/readiness/RBAC checks. Publishing depends on both succeeding.
+4. The image job publishes amd64/arm64 images with SBOM/provenance, signs the
+   image index digest, and uploads a Trivy vulnerability/license report.
+5. `release-chart.yml`, called only after the image job succeeds, stages the
+   source chart with the published image repository and immutable image digest.
+   It includes LICENSE/NOTICE, packages and pushes to GHCR with native Helm OCI
+   support, pulls back by digest, compares package contents, renders, and signs.
 
-#### [helm.yml](helm.yml)
-**Purpose:** Lint and test Helm charts  
-**Triggers:** Push/PR affecting `charts/**`  
-**Jobs:**
-- **Lint:** Runs `helm lint` on all charts
-- **Test:** Deploys charts to a Kind cluster to verify installation
+The image version tag is reused on retry only if both platform images identify
+the same source repository, release commit, and version. Existing chart versions
+are pulled and compared; conflicting contents are rejected rather than overwritten.
+Registry authentication/network failures are not treated as missing artifacts.
 
-**Secrets Required:** None
+The manual **Release** workflow input is an existing release tag, not a branch.
+Use it to recover a partial publication. The release summary contains both
+artifact digests and an installation command.
 
-#### [shellcheck.yml](shellcheck.yml)
-**Purpose:** Validate shell scripts  
-**Triggers:** Push/PR affecting `**.sh` files  
-**Jobs:** Runs ShellCheck on all bash scripts
+`release-monthly.yml` opens a small monthly refresh PR. After review and merge,
+Release Please requests a patch release through the same flow. It does not invent
+another version or publish an independently versioned image. Dependabot maintains
+pinned base images, modules, and actions; a scheduled refresh alone does not update
+those pins.
 
-**Secrets Required:** None
+## One-time GitHub setup
 
-### Release Workflows
+1. Enable Actions for the fork.
+2. Set the repository secret `GH_TOKEN` for Release Please and monthly refresh PRs.
+   It must have access to this repository's contents and pull requests. A PAT or
+   equivalent automation token is needed so generated PRs and tags trigger CI and
+   the release workflow. It is never an Infoblox credential.
+3. Image/chart publishing uses the automatic `GITHUB_TOKEN` with job-scoped
+   `packages: write`; signing uses job-scoped `id-token: write`. If a package
+   already exists, grant this repository Actions access to it in GHCR settings.
+4. After first publication, set **both GHCR packages to Public** in their package
+   settings so anonymous image/chart pulls work. New GHCR packages may start private
+   even when the GitHub repository is public. Link the chart package to this source
+   repository if GHCR has not automatically associated it.
+5. Check the first hosted CI and versioned release runs. Local validation cannot
+   prove registry permissions or GitHub OIDC signing.
 
-#### [release.yml](release.yml)
-**Purpose:** Build and publish releases from tags  
-**Triggers:** Git tags (e.g., `v1.0.0`)  
-**Jobs:**
-- **Build and Push:** Builds and pushes Docker image with semantic versioning tags
-- **Helm Version Updater:** Creates PRs to update Helm chart versions
+GitHub Pages and a `gh-pages` branch are not part of this publishing setup.
+For this breaking configuration migration, use a breaking-change Conventional
+Commit when preparing the first release PR so Release Please selects an appropriate
+major version. An inherited upstream tag does not imply fork artifacts exist.
 
-**Secrets Required:**
-- `GITHUB_TOKEN` (automatic)
-- `USER_PAT` (for creating PRs that trigger workflows)
+## Install the public chart
 
-#### [release-monthly.yml](release-monthly.yml)
-**Purpose:** Automated monthly releases for dependency updates  
-**Triggers:** Monthly cron (1st of month at 00:00 UTC), manual  
-**Jobs:**
-- **Release Build and Push:** Builds new image only if content differs from previous; if released, tags the next patch version and opens a PR syncing `.release-please-manifest.json` and the chart `version`/`appVersion` to it, so Release Please doesn't propose an already-published version
-
-**Secrets Required:**
-- `GITHUB_TOKEN`
-- `GH_TOKEN` (PAT, so the sync PR triggers CI)
-
-#### [deploy-chart-on-pr-close.yml](deploy-chart-on-pr-close.yml)
-**Purpose:** Deploy Helm charts to gh-pages after PR merge  
-**Triggers:** PR close events affecting `charts/**`  
-**Jobs:** Runs chart-releaser to publish charts
-
-**Secrets Required:**
-- `USER_PAT`
-
-### Security Workflows
-
-#### [codeql.yml](codeql.yml)
-**Purpose:** Static code analysis for security vulnerabilities  
-**Triggers:** Push to main, PRs, weekly schedule, manual  
-**Jobs:** Runs CodeQL analysis on Go code
-
-**Secrets Required:** None
-
-#### [trivy.yml](trivy.yml)
-**Purpose:** Container vulnerability scanning  
-**Triggers:** Push to main, PRs affecting Docker/Go files, weekly schedule  
-**Jobs:** Scans Docker images for CVEs and uploads results to Security tab
-
-**Secrets Required:** None
-
-#### [scorecard.yml](scorecard.yml)
-**Purpose:** OpenSSF Scorecard security analysis  
-**Triggers:** Push to main, branch protection changes, weekly schedule  
-**Jobs:** Analyzes repository security posture
-
-**Secrets Required:** None (uses `GITHUB_TOKEN`)
-
-#### [dependency-review.yml](dependency-review.yml)
-**Purpose:** Review dependencies in PRs for vulnerabilities  
-**Triggers:** Pull Requests  
-**Jobs:** Scans dependency changes for known vulnerabilities
-
-**Secrets Required:** None
-
-## Concurrency Control
-
-All workflows use concurrency groups to prevent overlapping runs:
-- Most workflows cancel in-progress runs when new commits are pushed
-- Release workflows do NOT cancel to ensure releases complete
-
-## Caching Strategy
-
-- **Go modules:** Cached via `actions/setup-go` with `cache: true`
-- **Docker layers:** Cached via GitHub Actions cache (`type=gha`)
-- **Kubebuilder test assets:** Downloaded and cached per workflow run
-
-## Security Hardening
-
-All workflows use:
-- **step-security/harden-runner:** Network egress control and auditing
-- **SHA-pinned actions:** All actions pinned to specific commit SHAs
-- **Minimal permissions:** Each job declares only required permissions
-
-## Maintenance
-
-- **Dependabot:** Automatically updates action versions monthly (see `.github/dependabot.yml`)
-- **Version comments:** All pinned actions include version comments for readability
-
-## Local Testing
-
-To test workflows locally, you can use [act](https://github.com/nektos/act):
-
-```bash
-# Install act
-brew install act  # macOS
-# or download from https://github.com/nektos/act/releases
-
-# Test CI workflow
-act pull_request -W .github/workflows/ci.yml
-
-# Test with specific secrets
-act -s GITHUB_TOKEN=your_token
+```sh
+helm upgrade --install infoblox-webhook \
+  oci://ghcr.io/balex42/charts/cert-manager-webhook-infoblox-wapi \
+  --version X.Y.Z \
+  --namespace infoblox-webhook --create-namespace \
+  --values values-production.yaml
 ```
 
-## Troubleshooting
+The published chart supplies its matching image digest by default. To pin the
+chart artifact itself, use the chart digest from the release summary:
 
-### Workflow fails on go.mod verification
-Run locally: `go mod tidy` and commit changes
+```sh
+helm upgrade --install infoblox-webhook \
+  oci://ghcr.io/balex42/charts/cert-manager-webhook-infoblox-wapi@sha256:CHART_DIGEST \
+  --namespace infoblox-webhook --create-namespace \
+  --values values-production.yaml
+```
 
-### golangci-lint fails
-Run locally: `golangci-lint run`  
-Fix issues or update `.golangci.yml` to exclude false positives
+## Verify signatures
 
-### Docker build fails
-Check Dockerfile syntax and ensure all dependencies are available
+Replace VERSION and DIGEST with actual values. For tag-triggered releases:
 
-### Helm lint fails
-Run locally: `helm lint charts/cert-manager-webhook-infoblox-wapi/`
+```sh
+cosign verify \
+  --certificate-identity=https://github.com/balex42/cert-manager-webhook-infoblox-wapi/.github/workflows/release.yml@refs/tags/vVERSION \
+  --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
+  ghcr.io/balex42/cert-manager-webhook-infoblox-wapi@sha256:IMAGE_DIGEST
 
-## Adding New Workflows
+cosign verify \
+  --certificate-identity=https://github.com/balex42/cert-manager-webhook-infoblox-wapi/.github/workflows/release-chart.yml@refs/tags/vVERSION \
+  --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
+  ghcr.io/balex42/charts/cert-manager-webhook-infoblox-wapi@sha256:CHART_DIGEST
+```
 
-When creating new workflows:
+Manual runs use the ref selected when dispatching the workflow for their signing
+identity (usually `refs/heads/main`), while checkout and metadata validation still
+use the explicitly supplied release tag. For a local reusable workflow, GitHub
+records the called workflow's identity; verify the identity from that run.
+Cosign verification is separate from Helm's GPG-based `--verify` option.
 
-1. Add concurrency control
-2. Use step-security/harden-runner
-3. Pin all actions to SHA with version comments
-4. Set minimal permissions
-5. Add caching where applicable
-6. Update this README
-7. Test with `act` if possible
+## Checks and maintenance
+
+- `ci.yml`: module tidiness, vet/lint, regression/race tests, Python release-tool
+  tests, coverage, and multi-platform image builds.
+- `helm.yml`: chart rendering/schema tests, an OCI registry service round-trip
+  (publish/pull/retry/conflict), and Kind deployment/namespace/RBAC tests.
+- CodeQL, dependency review/submission, Scorecard, ShellCheck, and scheduled Trivy
+  workflows retain upstream analysis. Review the Trivy report and dependency
+  licenses when distributing images; root Apache licensing does not cover every
+  compiled module or base-image package.
+
+Base-image multi-platform digest pins are maintained by Docker Dependabot. Keep
+the compiler pin aligned across Dockerfile, go.mod, .mise.toml, and CI. Native
+Helm OCI commands are tested with Helm 3.19.0. Live Infoblox conformance still
+requires an external environment; see [testing](../../docs/TESTING.md).

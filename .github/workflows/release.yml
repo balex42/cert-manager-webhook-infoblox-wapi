@@ -1,75 +1,124 @@
+# Modified by the balex42 fork: validate one revision, then publish image and OCI chart.
 name: Release
 
 on:
   push:
-    tags:
-      - "*"
-  workflow_dispatch: # Allows manual triggering
-
-env:
-  REGISTRY: ghcr.io
-  REPOSITORY: ${{ github.repository }}
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to publish or retry (vX.Y.Z)
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false # Don't cancel releases
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
-  build-and-push:
-    name: Build and Push
+  validate:
+    name: Validate Release Metadata
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    permissions:
-      contents: read
-      packages: write
     outputs:
-      tags: ${{ steps.meta.outputs.tags }}
-      digest: ${{ steps.build.outputs.digest }}
-
+      version: ${{ steps.release.outputs.version }}
+      revision: ${{ steps.release.outputs.revision }}
+      image: ${{ steps.release.outputs.image }}
+      chart_parent: ${{ steps.release.outputs.chart_parent }}
     steps:
       - name: Harden Runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
         with:
           disable-sudo: true
           egress-policy: audit
-
-      - name: Checkout Repository
+      - name: Checkout Release Tag
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
-          fetch-tags: true
+      - name: Validate Tag and Chart Versions
+        id: release
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
+        run: python3 workflow_scripts/release.py validate --tag "$RELEASE_TAG" --repository "$REPOSITORY"
 
+  ci:
+    name: Release CI
+    needs: validate
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.validate.outputs.revision }}
+
+  helm:
+    name: Release Chart Tests
+    needs: validate
+    uses: ./.github/workflows/helm.yml
+    with:
+      ref: ${{ needs.validate.outputs.revision }}
+
+  image:
+    name: Publish and Sign Image
+    needs: [validate, ci, helm]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    outputs:
+      digest: ${{ steps.result.outputs.digest }}
+    env:
+      IMAGE: ${{ needs.validate.outputs.image }}
+      VERSION: ${{ needs.validate.outputs.version }}
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          disable-sudo: true
+          egress-policy: audit
+      - name: Checkout Validated Revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.revision }}
       - name: Set Up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
-
-      - name: Log Into Registry
+      - name: Log Into GHCR
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
-          registry: ${{ env.REGISTRY }}
+          registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      # During a release workflow the new git tag is provided and is automatically used by this step to generate the new image tags.
-      - name: Extract Docker Metadata
+      - name: Check Existing Immutable Version
+        id: existing
+        env:
+          REGISTRY_USERNAME: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+          REVISION: ${{ needs.validate.outputs.revision }}
+          SOURCE: https://github.com/${{ github.repository }}
+        run: |
+          python3 workflow_scripts/release.py image \
+            --repository "${IMAGE#ghcr.io/}" --version "$VERSION" \
+            --revision "$REVISION" --source "$SOURCE"
+      - name: Extract Image Metadata
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
-          images: ${{ env.REGISTRY }}/${{ env.REPOSITORY }}
+          images: ${{ env.IMAGE }}
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-
-      - name: Build and Push Docker Image
+            type=semver,pattern={{version}},value=${{ env.VERSION }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ env.VERSION }}
+            type=semver,pattern={{major}},value=${{ env.VERSION }}
+            type=raw,value=latest,enable=${{ !contains(env.VERSION, '-') }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ needs.validate.outputs.revision }}
+            org.opencontainers.image.version=${{ env.VERSION }}
+      - name: Build and Push Image
         id: build
-        if: steps.meta.outputs.tags != ''
+        if: steps.existing.outputs.digest == ''
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
@@ -79,23 +128,45 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-      - name: Output Image Details
+          sbom: true
+          provenance: mode=max
+      - name: Select Published Digest
+        id: result
+        env:
+          DIGEST: ${{ steps.existing.outputs.digest || steps.build.outputs.digest }}
         run: |
-          echo "Docker image pushed with digest: ${{ steps.build.outputs.digest }}"
-          echo "Image tags:"
-          echo "${{ steps.meta.outputs.tags }}" | tr ',' '\n'
-          echo ""
-          echo "To use with digest:"
-          VERSION=$(echo "${{ github.ref_name }}" | sed 's/^v//')
-          echo "  ${{ env.REGISTRY }}/${{ env.REPOSITORY }}:${VERSION}@${{ steps.build.outputs.digest }}"
+          test -n "$DIGEST"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad # v4.0.0
+      - name: Sign Image Digest
+        env:
+          DIGEST: ${{ steps.result.outputs.digest }}
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"
+      - name: Scan Published Image and Licenses
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}@${{ steps.result.outputs.digest }}
+          scanners: vuln,license
+          format: json
+          output: image-report.json
+      - name: Upload Image Report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: image-vulnerability-license-report
+          path: image-report.json
 
-  # NOTE: The Helm chart `version` and `appVersion` are bumped by Release Please
-  # (see .release-please-config.json `extra-files`), keeping the chart, the app,
-  # and the published image on a single version. A previous design used the
-  # lrstanley/helm-version-updater action here to open a separate chart-bump PR,
-  # but that ran its own independent SemVer calculation and drifted the chart to
-  # 2.0.0 while the app stayed on 1.x -- producing a chart that referenced a
-  # non-existent image tag (issue #218). That mechanism has been removed so
-  # Release Please is the single source of truth for the version.
-
+  chart:
+    name: Publish OCI Chart
+    needs: [validate, image]
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    uses: ./.github/workflows/release-chart.yml
+    with:
+      ref: ${{ needs.validate.outputs.revision }}
+      version: ${{ needs.validate.outputs.version }}
+      image: ${{ needs.validate.outputs.image }}
+      image-digest: ${{ needs.image.outputs.digest }}
+      chart-parent: ${{ needs.validate.outputs.chart_parent }}

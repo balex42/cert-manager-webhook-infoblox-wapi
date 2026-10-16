@@ -1,229 +1,85 @@
-# Testing Guide
+# Testing the shared-account webhook
 
-This document explains how to test the cert-manager-webhook-infoblox-wapi webhook.
+Modified for the balex42 fork. Unit tests require the Go version in `go.mod`.
+Race tests also need a C compiler and CGO enabled.
 
-## Prerequisites
+## Local regression tests
 
-- Go 1.23 or later
-- `make` installed
-- (Optional) Access to an Infoblox GRID for integration testing
-
-## Quick Start
-
-Run unit tests (no Infoblox required):
-
-```bash
-make test
-```
-
-This will:
-1. Download and install `setup-envtest` tool
-2. Download Kubernetes test binaries (etcd, kube-apiserver, kubectl)
-3. Run the test suite
-
-## Test Types
-
-### Unit Tests (No Infoblox Required)
-
-The default `make test` command runs tests that validate the webhook structure without requiring actual Infoblox credentials. Tests are skipped gracefully if `TEST_ZONE_NAME` is not set.
-
-```bash
-make test
-```
-
-### Integration Tests (Requires Infoblox)
-
-To run full integration tests against a real Infoblox GRID:
-
-```bash
-export TEST_ZONE_NAME="example.com."  # Must end with a dot
-make test
-```
-
-**Note:** Integration tests require:
-- A configured Infoblox GRID accessible from your test environment
-- Valid credentials in `testdata/infoblox-wapi/credentials.yaml`
-- Proper configuration in `testdata/infoblox-wapi/config.json`
-
-### Coverage Tests
-
-Generate a coverage report:
-
-```bash
-make test-coverage
-```
-
-This creates `coverage.out` which can be viewed with:
-
-```bash
-go tool cover -html=coverage.out
-```
-
-### Race Detection Tests
-
-Run tests with the Go race detector:
-
-```bash
-make test-race
-```
-
-## Test Configuration
-
-### Test Data Structure
-
-The `testdata/infoblox-wapi/` directory contains test configuration:
-
-```
-testdata/infoblox-wapi/
-├── config.json           # Webhook configuration (required)
-├── config.json.sample    # Template
-├── credentials.yaml      # Infoblox credentials (gitignored)
-└── credentials.yaml.sample # Template
-```
-
-### Setting Up Integration Tests
-
-1. **Copy sample files:**
-   ```bash
-   cp testdata/infoblox-wapi/config.json.sample testdata/infoblox-wapi/config.json
-   cp testdata/infoblox-wapi/credentials.yaml.sample testdata/infoblox-wapi/credentials.yaml
-   ```
-
-2. **Configure Infoblox connection** in `config.json`:
-   ```json
-   {
-     "host": "infoblox.example.com",
-     "port": 443,
-     "version": "2.5",
-     "view": "default",
-     "sslVerify": true
-   }
-   ```
-
-3. **Add credentials** in `credentials.yaml`:
-   ```yaml
-   username: admin
-   password: your-password
-   ```
-
-4. **Run tests:**
-   ```bash
-   TEST_ZONE_NAME="your-zone.example.com." make test
-   ```
-
-## Continuous Integration
-
-The CI workflow (`.github/workflows/ci.yml`) automatically:
-- Runs unit tests on every PR and push
-- Skips integration tests (no credentials available)
-- Generates coverage reports
-- Runs race detector
-- Uploads coverage to Codecov
-
-### Local CI Simulation
-
-To simulate CI locally:
-
-```bash
-# Run all checks
+```sh
 make test
 make test-race
 make test-coverage
 go vet ./...
-gofmt -l .
+go test -tags=chart -run TestChartConfiguration . # Requires helm in PATH.
+python3 -m unittest discover -s tests -p 'test_release*.py' -v
 ```
 
-Or use the linter (after installing golangci-lint):
+Unit tests contact only local HTTPS WAPI stubs. They exercise actual connector
+serialization and filtering, repeated and concurrent calls, isolated cleanup,
+credential rotation, error propagation, and TLS failure behavior. They do not
+require Kubernetes, a real GRID, or public DNS. Helm tests verify the rendered
+deployment contract and schema failures.
 
-```bash
-golangci-lint run
+Release-tool tests use Python's standard library. Set `OCI_TEST_REGISTRY` to a
+disposable local Registry v2 instance (for example, `127.0.0.1:5000`) to also test
+real Helm OCI push/pull, retry preservation, and rejection of conflicting image
+digests for the same chart version. This test deliberately uses plain HTTP for
+the local registry; production publishing uses HTTPS. The Helm CI workflow runs
+this round-trip against its own registry service.
+
+## Kubernetes deployment/RBAC checks
+
+The Helm workflow loads the fork image into Kind and installs cert-manager and
+the chart. It supplies a test credentials Secret, requires serving Certificates,
+Deployment and APIService readiness, runs the chart health test, and checks that
+the webhook cannot read Secrets through Kubernetes in three namespaces.
+
+WAPI is not contacted at startup. Readiness establishes API availability, not
+reachability of Infoblox or successful issuance.
+
+## Live Infoblox conformance
+
+Use a dedicated DNS test zone, a least-privileged Infoblox account, and a WAPI
+version supported by the test GRID. Mount credentials as `/etc/secrets/creds.json`
+in the test runner and, for private PKI, mount the CA bundle. Both files contain
+ordinary JSON/PEM, not individually base64-encoded values.
+
+Copy `testdata/infoblox-wapi/config.json.sample` to `config.json` and set the
+actual DNS view. Export the deployment settings:
+
+```sh
+export INFOBLOX_HOST=infoblox.example.com
+export INFOBLOX_PORT=443
+export INFOBLOX_VERSION=2.10
+export INFOBLOX_CA_FILE=/etc/infoblox-ca/ca.crt
+export TEST_ZONE_NAME=acme-test.example.com.
+make test-integration
 ```
 
-## Test Environment
+Omit `INFOBLOX_CA_FILE` when system trust suffices. The fixture enables ambient
+credentials to match the shared-account design. The integration build tag and
+`TEST_ZONE_NAME` are required; a skipped test is not conformance evidence.
+The integration target downloads envtest assets for the cert-manager fixture.
 
-The test suite uses [envtest](https://book.kubebuilder.io/reference/envtest.html) which provides:
-- A real Kubernetes API server
-- etcd for storage
-- No kubelet (pods won't run)
-- No controller manager
-- Perfect for testing CRDs and webhooks
+## End-to-end acceptance in your cluster
 
-### Envtest Versions
+After deploying the fork with internal CA verification enabled:
 
-By default, tests use Kubernetes 1.31.x. Override with:
+1. Create one staging ClusterIssuer using the webhook and two application namespaces.
+2. Request a Certificate with both `example.com` and `*.example.com` in namespace A,
+   using domains delegated to the test GRID and visible to the ACME test server.
+3. Request an overlapping Certificate in namespace B while A is issuing.
+4. Observe challenge TXT records in the configured DNS view and verify issuance.
+   cert-manager may serialize challenges for a DNS name; the unit suite separately
+   exercises genuinely simultaneous webhook calls.
+5. Verify cleanup removed only completed challenge values. Seed an unrelated TXT
+   value and an identically named record in another view before the test.
+6. Rotate the mounted credentials; after Secret projection, repeat issuance.
+7. Update the CA ConfigMap to the intended replacement chain and repeat issuance.
+   An invalid bundle must fail operations, never disable verification.
+8. Confirm the webhook's service account has no Secret-reading access in either
+   application namespace or the webhook namespace.
 
-```bash
-make test ENVTEST_K8S_VERSION=1.30.x
-```
-
-Available versions are listed at:
-https://raw.githubusercontent.com/kubernetes-sigs/controller-tools/HEAD/envtest-releases.yaml
-
-## Troubleshooting
-
-### Tests fail with "etcd not found"
-
-The Makefile should automatically download test assets. If it fails:
-
-```bash
-# Clean and retry
-make clean
-make test
-```
-
-### Tests hang
-
-Check if etcd or kube-apiserver are already running:
-
-```bash
-pkill -9 etcd kube-apiserver
-make test
-```
-
-### Integration tests fail
-
-1. Verify Infoblox connectivity:
-   ```bash
-   curl -k https://your-infoblox-host/wapi/v2.5/
-   ```
-
-2. Check credentials are correct in `testdata/infoblox-wapi/credentials.yaml`
-
-3. Verify DNS zone exists in Infoblox
-
-4. Ensure TEST_ZONE_NAME ends with a dot: `example.com.`
-
-### Permission denied errors
-
-The test binaries need execute permissions:
-
-```bash
-chmod +x bin/setup-envtest
-```
-
-## Writing Tests
-
-When adding new tests, follow the cert-manager webhook test patterns:
-
-```go
-func TestMyFeature(t *testing.T) {
-    // Arrange
-    solver := &customDNSProviderSolver{}
-    
-    // Act
-    result := solver.MyMethod()
-    
-    // Assert
-    if result != expected {
-        t.Errorf("expected %v, got %v", expected, result)
-    }
-}
-```
-
-For DNS challenge tests, use the `acmetest.NewFixture` helper (see `main_test.go`).
-
-## Related Documentation
-
-- [cert-manager Webhook Testing](https://cert-manager.io/docs/contributing/dns-providers/)
-- [Kubebuilder Envtest](https://book.kubebuilder.io/reference/envtest.html)
-- [cert-manager Webhook Example](https://github.com/cert-manager/webhook-example)
+For split-horizon DNS, verify both cert-manager self-check and ACME authoritative
+visibility. Record the cluster, cert-manager/GRID versions, image digest, zone/view,
+and test result when collecting production-readiness evidence.
