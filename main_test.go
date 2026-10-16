@@ -1,5 +1,6 @@
 //go:build integration
 
+// Modified by the balex42 fork: shared mounted credentials are ambient credentials.
 package main
 
 import (
@@ -22,7 +23,7 @@ func TestRunsSuite(t *testing.T) {
 	// ChallengeRequest passed as part of the test cases.
 	fixture := acmetest.NewFixture(&customDNSProviderSolver{},
 		acmetest.SetResolvedZone(zone),
-		acmetest.SetAllowAmbientCredentials(false),
+		acmetest.SetAllowAmbientCredentials(true),
 		acmetest.SetManifestPath("testdata/infoblox-wapi"),
 		// Use SetDNSServer if testing against a real DNS server
 		// acmetest.SetDNSServer("8.8.8.8:53"),

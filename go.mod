@@ -1,5 +1,6 @@
 // cspell:disable
-module github.com/sarg3nt/cert-manager-webhook-infoblox-wapi
+// Modified by the balex42 fork: module identity and dependency classification.
+module github.com/balex42/cert-manager-webhook-infoblox-wapi
 
 // https://go.dev/dl/
 go 1.26.4
@@ -8,9 +9,7 @@ require (
 	github.com/cert-manager/cert-manager v1.21.1
 	github.com/infobloxopen/infoblox-go-client/v2 v2.12.0
 	github.com/stretchr/testify v1.12.1
-	k8s.io/api v0.37.0
 	k8s.io/apiextensions-apiserver v0.37.0
-	k8s.io/apimachinery v0.37.0
 	k8s.io/client-go v0.37.0
 	k8s.io/klog/v2 v2.140.0
 )
@@ -107,6 +106,8 @@ require (
 	gopkg.in/evanphx/json-patch.v4 v4.13.0 // indirect
 	gopkg.in/inf.v0 v0.9.1 // indirect
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
+	k8s.io/api v0.37.0 // indirect
+	k8s.io/apimachinery v0.37.0 // indirect
 	k8s.io/apiserver v0.37.0 // indirect
 	k8s.io/component-base v0.37.0 // indirect
 	k8s.io/kms v0.37.0 // indirect

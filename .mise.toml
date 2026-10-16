@@ -1,3 +1,4 @@
+# Modified by the balex42 fork: align Go with go.mod and image builds.
 # See: https://mise.jdx.dev/configuration.html for config options.
 # NOTE: Top level tools are installed in home/vscode/config/mise/config.toml during setup.
 #[env]
@@ -6,7 +7,7 @@
 
 [tools]
 # specify single or multiple versions of specific tools you want installed for this project.
-golang = '1.25.5'
+golang = '1.26.4'
 #golangci-lint = '2.7.2'
 #goreleaser = "2.3.2"
 kubectl = "1.30"

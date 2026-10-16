@@ -1,565 +1,313 @@
+// Modified by the balex42 fork: exercise the real connector against a TLS WAPI stub.
 package main
 
 import (
 	"encoding/json"
+	"encoding/pem"
+	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 
+	whapi "github.com/cert-manager/cert-manager/pkg/acme/webhook/apis/acme/v1alpha1"
+	ibclient "github.com/infobloxopen/infoblox-go-client/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes/fake"
-
-	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 )
 
-// TestName verifies the solver name is correct
-func TestName(t *testing.T) {
-	solver := &customDNSProviderSolver{}
-	assert.Equal(t, "infoblox-wapi", solver.Name())
-}
-
-// TestDeDot verifies trailing dot removal from FQDNs
-func TestDeDot(t *testing.T) {
-	solver := &customDNSProviderSolver{}
-
-	tests := []struct {
-		name     string
-		input    string
-		expected string
-	}{
-		{
-			name:     "FQDN with trailing dot",
-			input:    "example.com.",
-			expected: "example.com",
-		},
-		{
-			name:     "FQDN without trailing dot",
-			input:    "example.com",
-			expected: "example.com",
-		},
-		{
-			name:     "subdomain with trailing dot",
-			input:    "_acme-challenge.example.com.",
-			expected: "_acme-challenge.example.com",
-		},
-		{
-			name:     "empty string",
-			input:    "",
-			expected: "",
-		},
-		{
-			name:     "just a dot",
-			input:    ".",
-			expected: "",
-		},
-		{
-			name:     "multiple dots in middle",
-			input:    "sub.domain.example.com.",
-			expected: "sub.domain.example.com",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := solver.DeDot(tt.input)
-			assert.Equal(t, tt.expected, result)
-		})
-	}
-}
-
-// TestLoadConfig_Valid tests successful configuration parsing
-func TestLoadConfig_Valid(t *testing.T) {
-	configJSON := `{
-		"host": "infoblox.example.com",
-		"port": "8443",
-		"version": "2.11",
-		"view": "Internal",
-		"sslVerify": true,
-		"httpRequestTimeout": 90,
-		"httpPoolConnections": 20,
-		"ttl": 600,
-		"useTtl": true
-	}`
-
-	raw := apiextensionsv1.JSON{Raw: []byte(configJSON)}
-	cfg, err := loadConfig(&raw)
-
-	require.NoError(t, err)
-	assert.Equal(t, "infoblox.example.com", cfg.Host)
-	assert.Equal(t, "8443", cfg.Port)
-	assert.Equal(t, "2.11", cfg.Version)
-	assert.Equal(t, "Internal", cfg.View)
-	assert.True(t, cfg.SslVerify)
-	assert.Equal(t, 90, cfg.HTTPRequestTimeout)
-	assert.Equal(t, 20, cfg.HTTPPoolConnections)
-	assert.Equal(t, uint32(600), cfg.TTL)
-	assert.True(t, cfg.UseTTL)
-}
-
-// TestLoadConfig_Nil tests the base case with no configuration
-func TestLoadConfig_Nil(t *testing.T) {
-	cfg, err := loadConfig(nil)
-
-	require.NoError(t, err)
-	// Should get zero values
-	assert.Equal(t, "", cfg.Host)
-}
-
-// TestLoadConfig_Empty tests with empty JSON object
-func TestLoadConfig_Empty(t *testing.T) {
-	raw := apiextensionsv1.JSON{Raw: []byte("{}")}
-	cfg, err := loadConfig(&raw)
-
-	require.NoError(t, err)
-	assert.Equal(t, "", cfg.Host)
-}
-
-// TestLoadConfig_InvalidJSON tests error handling for malformed JSON
-func TestLoadConfig_InvalidJSON(t *testing.T) {
-	raw := apiextensionsv1.JSON{Raw: []byte("invalid json")}
-	_, err := loadConfig(&raw)
-
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "Error decoding solver config")
-}
-
-// TestApplyDefaults tests that defaults are correctly applied
-func TestApplyDefaults(t *testing.T) {
-	tests := []struct {
-		name     string
-		input    customDNSProviderConfig
-		expected customDNSProviderConfig
-	}{
-		{
-			name:  "all empty values get defaults",
-			input: customDNSProviderConfig{},
-			expected: customDNSProviderConfig{
-				Port:                "443",
-				Version:             "2.10",
-				HTTPRequestTimeout:  60,
-				HTTPPoolConnections: 10,
-				TTL:                 300,
-			},
-		},
-		{
-			name: "custom values are preserved",
-			input: customDNSProviderConfig{
-				Port:                "8443",
-				Version:             "2.11",
-				HTTPRequestTimeout:  90,
-				HTTPPoolConnections: 20,
-				TTL:                 600,
-			},
-			expected: customDNSProviderConfig{
-				Port:                "8443",
-				Version:             "2.11",
-				HTTPRequestTimeout:  90,
-				HTTPPoolConnections: 20,
-				TTL:                 600,
-			},
-		},
-		{
-			name: "partial config gets remaining defaults",
-			input: customDNSProviderConfig{
-				Port:    "8443",
-				Version: "2.11",
-			},
-			expected: customDNSProviderConfig{
-				Port:                "8443",
-				Version:             "2.11",
-				HTTPRequestTimeout:  60,
-				HTTPPoolConnections: 10,
-				TTL:                 300,
-			},
-		},
-		{
-			name: "negative timeout gets default",
-			input: customDNSProviderConfig{
-				HTTPRequestTimeout: -10,
-			},
-			expected: customDNSProviderConfig{
-				Port:                "443",
-				Version:             "2.10",
-				HTTPRequestTimeout:  60,
-				HTTPPoolConnections: 10,
-				TTL:                 300,
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			cfg := tt.input
-			applyDefaults(&cfg)
-			assert.Equal(t, tt.expected, cfg)
-		})
-	}
-}
-
-// TestLoadConfig_WithDefaults tests that loadConfig applies defaults
-func TestLoadConfig_WithDefaults(t *testing.T) {
-	// Config with only host set
-	configJSON := `{"host": "infoblox.example.com"}`
-	raw := apiextensionsv1.JSON{Raw: []byte(configJSON)}
-
-	cfg, err := loadConfig(&raw)
-
-	require.NoError(t, err)
-	assert.Equal(t, "infoblox.example.com", cfg.Host)
-	// Check defaults were applied
-	assert.Equal(t, "443", cfg.Port)
-	assert.Equal(t, "2.10", cfg.Version)
-	assert.Equal(t, 60, cfg.HTTPRequestTimeout)
-	assert.Equal(t, 10, cfg.HTTPPoolConnections)
-	assert.Equal(t, uint32(300), cfg.TTL)
-}
-
-// TestGetSecret tests secret retrieval from Kubernetes
-func TestGetSecret(t *testing.T) {
-	// Create fake clientset with a test secret
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-secret",
-			Namespace: "test-namespace",
-		},
-		Data: map[string][]byte{
-			"username": []byte("testuser"),
-			"password": []byte("testpass\n"), // with newline to test trimming
-		},
-	}
-
-	fakeClient := fake.NewClientset(secret)
-	solver := &customDNSProviderSolver{client: fakeClient}
-
-	tests := []struct {
-		name      string
-		selector  cmmeta.SecretKeySelector
-		namespace string
-		expected  string
+func TestLoadConfig(t *testing.T) {
+	for _, tc := range []struct {
+		name, raw string
 		wantError bool
-		errorMsg  string
 	}{
-		{
-			name: "successful retrieval",
-			selector: cmmeta.SecretKeySelector{
-				LocalObjectReference: cmmeta.LocalObjectReference{
-					Name: "test-secret",
-				},
-				Key: "username",
-			},
-			namespace: "test-namespace",
-			expected:  "testuser",
-			wantError: false,
-		},
-		{
-			name: "newline trimming",
-			selector: cmmeta.SecretKeySelector{
-				LocalObjectReference: cmmeta.LocalObjectReference{
-					Name: "test-secret",
-				},
-				Key: "password",
-			},
-			namespace: "test-namespace",
-			expected:  "testpass",
-			wantError: false,
-		},
-		{
-			name: "secret not found",
-			selector: cmmeta.SecretKeySelector{
-				LocalObjectReference: cmmeta.LocalObjectReference{
-					Name: "nonexistent-secret",
-				},
-				Key: "username",
-			},
-			namespace: "test-namespace",
-			wantError: true,
-			errorMsg:  "failed to get secret",
-		},
-		{
-			name: "key not found in secret",
-			selector: cmmeta.SecretKeySelector{
-				LocalObjectReference: cmmeta.LocalObjectReference{
-					Name: "test-secret",
-				},
-				Key: "nonexistent-key",
-			},
-			namespace: "test-namespace",
-			wantError: true,
-			errorMsg:  "key nonexistent-key not found in secret",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result, err := solver.getSecret(tt.selector, tt.namespace)
-
-			if tt.wantError {
+		{"valid", `{"view":"External","ttl":600,"useTtl":false}`, false},
+		{"defaults", `{"view":"External"}`, false},
+		{"missing view", `{}`, true},
+		{"bad JSON", `invalid`, true},
+		{"null", `null`, true},
+		{"negative TTL", `{"view":"External","ttl":-1}`, true},
+		{"endpoint override", `{"view":"External","host":"attacker.example"}`, true},
+		{"TLS override", `{"view":"External","sslVerify":false}`, true},
+		{"credentials override", `{"view":"External","getUserFromVolume":true}`, true},
+		{"trailing document", `{"view":"External"}{}`, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := loadConfig(&apiextensionsv1.JSON{Raw: []byte(tc.raw)})
+			if tc.wantError {
 				require.Error(t, err)
-				assert.Contains(t, err.Error(), tt.errorMsg)
+				return
+			}
+			require.NoError(t, err)
+			if tc.name == "defaults" {
+				assert.Equal(t, uint32(300), cfg.TTL)
+				assert.True(t, cfg.UseTTL)
 			} else {
-				require.NoError(t, err)
-				assert.Equal(t, tt.expected, result)
+				assert.Equal(t, uint32(600), cfg.TTL)
+				assert.False(t, cfg.UseTTL)
 			}
 		})
 	}
-}
-
-// TestGetIbClient_WithSecretRefs tests client initialization with secret references
-func TestGetIbClient_WithSecretRefs(t *testing.T) {
-	// Create fake clientset with credentials
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "infoblox-creds",
-			Namespace: "test-namespace",
-		},
-		Data: map[string][]byte{
-			"username": []byte("admin"),
-			"password": []byte("secret123"),
-		},
-	}
-
-	fakeClient := fake.NewClientset(secret)
-	solver := &customDNSProviderSolver{client: fakeClient}
-
-	cfg := customDNSProviderConfig{
-		Host:    "infoblox.example.com",
-		Port:    "443",
-		Version: "2.10",
-		UsernameSecretRef: cmmeta.SecretKeySelector{
-			LocalObjectReference: cmmeta.LocalObjectReference{
-				Name: "infoblox-creds",
-			},
-			Key: "username",
-		},
-		PasswordSecretRef: cmmeta.SecretKeySelector{
-			LocalObjectReference: cmmeta.LocalObjectReference{
-				Name: "infoblox-creds",
-			},
-			Key: "password",
-		},
-		HTTPRequestTimeout:  60,
-		HTTPPoolConnections: 10,
-	}
-
-	ib, err := solver.getIbClient(&cfg, "test-namespace")
-
-	require.NoError(t, err)
-	assert.NotNil(t, ib)
-}
-
-// TestGetIbClient_NoCredentials tests error when no credentials configured
-func TestGetIbClient_NoCredentials(t *testing.T) {
-	solver := &customDNSProviderSolver{}
-
-	cfg := customDNSProviderConfig{
-		Host:    "infoblox.example.com",
-		Port:    "443",
-		Version: "2.10",
-	}
-
-	_, err := solver.getIbClient(&cfg, "test-namespace")
-
+	_, err := loadConfig(nil)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "No secretRefs or secretPath provided")
 }
 
-// TestGetIbClient_FromVolume tests loading credentials from volume file
-func TestGetIbClient_FromVolume(t *testing.T) {
-	// Create temporary credentials file
-	tmpDir := t.TempDir()
-	credsFile := filepath.Join(tmpDir, "creds.json")
-
-	creds := usernamePassword{
-		Username: "volumeuser",
-		Password: "volumepass",
-	}
-	credsJSON, err := json.Marshal(creds)
-	require.NoError(t, err)
-
-	err = os.WriteFile(credsFile, credsJSON, 0o600)
-	require.NoError(t, err)
-
-	// Temporarily change SecretPath constant behavior by testing the logic
-	// Note: In real scenario, we'd need to mount this at /etc/secrets/creds.json
-	// For unit test, we'll skip this test or mock the file read
-	t.Skip("Skipping volume test - requires mocking file system or integration test")
-}
-
-// TestGetIbClient_VolumeFileNotFound tests error when volume file doesn't exist
-func TestGetIbClient_VolumeFileNotFound(t *testing.T) {
-	solver := &customDNSProviderSolver{}
-
-	cfg := customDNSProviderConfig{
-		Host:              "infoblox.example.com",
-		GetUserFromVolume: true,
-	}
-
-	_, err := solver.getIbClient(&cfg, "test-namespace")
-
+func TestReadCredentials(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "creds.json")
+	_, err := readCredentials(path)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "does not exist")
+	for _, content := range []string{`{"username":"user"}`, `null`, `{"password":"private-value"}`, `{"username":123,"password":"private-value"}`, `private-value`} {
+		require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+		_, err := readCredentials(path)
+		require.Error(t, err)
+		assert.NotContains(t, err.Error(), "private-value")
+	}
+	for _, password := range []string{"first", "rotated", " spaces are preserved "} {
+		data, err := json.Marshal(usernamePassword{Username: "user", Password: password})
+		require.NoError(t, err)
+		require.NoError(t, os.WriteFile(path, data, 0o600))
+		creds, err := readCredentials(path)
+		require.NoError(t, err)
+		assert.Equal(t, password, creds.Password)
+	}
 }
 
-// TestGetIbClient_WithDefaultsFromLoadConfig tests that defaults from loadConfig work with getIbClient
-func TestGetIbClient_WithDefaultsFromLoadConfig(t *testing.T) {
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "infoblox-creds",
-			Namespace: "test-namespace",
-		},
-		Data: map[string][]byte{
-			"username": []byte("admin"),
-			"password": []byte("secret123"),
-		},
+type testTXT struct {
+	Ref    string `json:"_ref"`
+	Name   string `json:"name"`
+	Text   string `json:"text"`
+	View   string `json:"view"`
+	TTL    uint32 `json:"ttl"`
+	UseTTL bool   `json:"use_ttl"`
+}
+
+type testWAPI struct {
+	mu                                       sync.Mutex
+	records                                  map[string]testTXT
+	creates, deletes                         int
+	lookupStatus, createStatus, deleteStatus int
+	createThenFail                           bool
+	password                                 string
+}
+
+func (w *testWAPI) ServeHTTP(out http.ResponseWriter, req *http.Request) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	user, password, ok := req.BasicAuth()
+	if !ok || user != "user" || password != w.password {
+		http.Error(out, "bad credentials", http.StatusUnauthorized)
+		return
 	}
-
-	fakeClient := fake.NewClientset(secret)
-	solver := &customDNSProviderSolver{client: fakeClient}
-
-	// Simulate config loaded through loadConfig (which applies defaults)
-	cfg := customDNSProviderConfig{
-		Host: "infoblox.example.com",
-		UsernameSecretRef: cmmeta.SecretKeySelector{
-			LocalObjectReference: cmmeta.LocalObjectReference{
-				Name: "infoblox-creds",
-			},
-			Key: "username",
-		},
-		PasswordSecretRef: cmmeta.SecretKeySelector{
-			LocalObjectReference: cmmeta.LocalObjectReference{
-				Name: "infoblox-creds",
-			},
-			Key: "password",
-		},
+	out.Header().Set("Content-Type", "application/json")
+	switch req.Method {
+	case http.MethodGet:
+		if w.lookupStatus != 0 {
+			http.Error(out, "private-value", w.lookupStatus)
+			return
+		}
+		matches := []testTXT{}
+		for _, record := range w.records {
+			if record.Name == req.URL.Query().Get("name") && record.Text == req.URL.Query().Get("text") && record.View == req.URL.Query().Get("view") {
+				matches = append(matches, record)
+			}
+		}
+		_ = json.NewEncoder(out).Encode(matches)
+	case http.MethodPost:
+		if w.createStatus != 0 {
+			http.Error(out, "private-value", w.createStatus)
+			return
+		}
+		var record testTXT
+		if err := json.NewDecoder(req.Body).Decode(&record); err != nil {
+			http.Error(out, "invalid record", http.StatusBadRequest)
+			return
+		}
+		for _, existing := range w.records {
+			if existing.Name == record.Name && existing.Text == record.Text && existing.View == record.View {
+				http.Error(out, "duplicate private-value", http.StatusBadRequest)
+				return
+			}
+		}
+		w.creates++
+		record.Ref = fmt.Sprintf("record:txt/%d", w.creates)
+		w.records[record.Ref] = record
+		if w.createThenFail {
+			http.Error(out, "private-value", http.StatusServiceUnavailable)
+			return
+		}
+		out.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(out).Encode(record.Ref)
+	case http.MethodDelete:
+		if w.deleteStatus != 0 {
+			http.Error(out, "private-value", w.deleteStatus)
+			return
+		}
+		ref := strings.TrimPrefix(req.URL.Path, "/wapi/v2.10/")
+		if _, ok := w.records[ref]; !ok {
+			http.Error(out, "gone", http.StatusNotFound)
+			return
+		}
+		delete(w.records, ref)
+		w.deletes++
+		_ = json.NewEncoder(out).Encode(ref)
+	default:
+		http.Error(out, "unsupported method", http.StatusMethodNotAllowed)
 	}
-	// Apply defaults as loadConfig would do
-	applyDefaults(&cfg)
+}
 
-	ib, err := solver.getIbClient(&cfg, "test-namespace")
-
+func newTestSolver(t *testing.T) (*customDNSProviderSolver, *testWAPI) {
+	t.Helper()
+	wapi := &testWAPI{records: map[string]testTXT{}, password: "password"}
+	server := httptest.NewTLSServer(wapi)
+	t.Cleanup(server.Close)
+	host, port, err := net.SplitHostPort(strings.TrimPrefix(server.URL, "https://"))
 	require.NoError(t, err)
-	assert.NotNil(t, ib)
-	// Verify defaults were applied by applyDefaults (simulating loadConfig behavior)
-	assert.Equal(t, "443", cfg.Port)
-	assert.Equal(t, "2.10", cfg.Version)
-	assert.Equal(t, 60, cfg.HTTPRequestTimeout)
-	assert.Equal(t, 10, cfg.HTTPPoolConnections)
-	assert.Equal(t, uint32(300), cfg.TTL)
+	dir := t.TempDir()
+	credsPath := filepath.Join(dir, "creds.json")
+	require.NoError(t, os.WriteFile(credsPath, []byte(`{"username":"user","password":"password"}`), 0o600))
+	caPath := filepath.Join(dir, "ca.crt")
+	require.NoError(t, os.WriteFile(caPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}), 0o600))
+	return &customDNSProviderSolver{settings: deploymentSettings{
+		host: host, port: port, version: "2.10", credentialsPath: credsPath,
+		caPath: caPath, verify: true, timeout: 5, poolConnections: 2,
+	}}, wapi
 }
 
-// TestInitialize tests the Initialize method
-func TestInitialize(t *testing.T) {
-	// Create a fake REST config
-	// Note: This would normally connect to a real API server
-	// For unit testing, we skip or would need more sophisticated mocking
-	t.Skip("Initialize requires valid kubeClientConfig - better suited for integration test")
-}
-
-// Benchmark tests for performance-critical functions
-func BenchmarkDeDot(b *testing.B) {
-	solver := &customDNSProviderSolver{}
-	input := "_acme-challenge.example.com."
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		solver.DeDot(input)
+func challenge(value, view string) *whapi.ChallengeRequest {
+	config, _ := json.Marshal(customDNSProviderConfig{View: view, TTL: 600, UseTTL: true})
+	return &whapi.ChallengeRequest{
+		DNSName: "example.com", ResolvedFQDN: "_acme-challenge.example.com.", Key: value,
+		AllowAmbientCredentials: true, ResourceNamespace: "cert-manager",
+		Config: &apiextensionsv1.JSON{Raw: config},
 	}
 }
 
-func BenchmarkLoadConfig(b *testing.B) {
-	configJSON := `{
-		"host": "infoblox.example.com",
-		"port": "443",
-		"version": "2.10",
-		"view": "Internal"
-	}`
-	raw := apiextensionsv1.JSON{Raw: []byte(configJSON)}
+func TestPresentAndCleanup(t *testing.T) {
+	solver, wapi := newTestSolver(t)
+	assert.Equal(t, "infoblox-wapi", solver.Name())
+	assert.Equal(t, "_acme-challenge.example.com", solver.DeDot("_acme-challenge.example.com."))
+	a := challenge("apex-value", "External")
+	b := challenge("wildcard-value", "External")
+	b.DNSName = "*.example.com"
+	otherView := challenge("apex-value", "Internal")
+	for _, ch := range []*whapi.ChallengeRequest{a, a, b, otherView} {
+		require.NoError(t, solver.Present(ch))
+	}
+	assert.Len(t, wapi.records, 3)
+	assert.Equal(t, 3, wapi.creates)
+	assert.Zero(t, wapi.deletes)
+	for _, record := range wapi.records {
+		assert.Equal(t, uint32(600), record.TTL)
+		assert.True(t, record.UseTTL)
+	}
+	require.NoError(t, solver.CleanUp(a))
+	require.NoError(t, solver.CleanUp(a))
+	assert.Len(t, wapi.records, 2)
+	for _, record := range wapi.records {
+		assert.True(t, record.Text == b.Key || record.View == "Internal")
+	}
+	require.NoError(t, solver.CleanUp(b))
+	require.NoError(t, solver.CleanUp(otherView))
+	assert.Empty(t, wapi.records)
+}
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_, _ = loadConfig(&raw)
+func TestConcurrentPresentationAndCleanup(t *testing.T) {
+	solver, wapi := newTestSolver(t)
+	// Two values at the same name, each concurrently presented by several callers.
+	var wg sync.WaitGroup
+	errors := make(chan error, 20)
+	for i := range 20 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errors <- solver.Present(challenge(fmt.Sprintf("value-%d", i%2), "External"))
+		}()
+	}
+	wg.Wait()
+	close(errors)
+	for err := range errors {
+		require.NoError(t, err)
+	}
+	assert.Len(t, wapi.records, 2)
+	assert.Equal(t, 2, wapi.creates)
+	for range 10 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			assert.NoError(t, solver.CleanUp(challenge("value-0", "External")))
+		}()
+	}
+	wg.Wait()
+	assert.Len(t, wapi.records, 1)
+	for _, record := range wapi.records {
+		assert.Equal(t, "value-1", record.Text)
 	}
 }
 
-func BenchmarkApplyDefaults(b *testing.B) {
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		cfg := customDNSProviderConfig{}
-		applyDefaults(&cfg)
-	}
+func TestCreateResponseLost(t *testing.T) {
+	solver, wapi := newTestSolver(t)
+	wapi.createThenFail = true
+	require.NoError(t, solver.Present(challenge("value", "External")))
+	assert.Equal(t, 1, wapi.creates)
 }
 
-// TestGetSecret_ContextTimeout tests that getSecret respects context timeout
-func TestGetSecret_ContextTimeout(t *testing.T) {
-	// Create a fake client that simulates a slow response
-	// This would require more sophisticated mocking
-	t.Skip("Context timeout testing requires sophisticated mocking")
-}
-
-// Table-driven test for various configuration combinations
-func TestLoadConfig_Combinations(t *testing.T) {
-	tests := []struct {
-		name       string
-		configJSON string
-		validate   func(t *testing.T, cfg customDNSProviderConfig, err error)
-	}{
-		{
-			name:       "minimal valid config",
-			configJSON: `{"host": "infoblox.local"}`,
-			validate: func(t *testing.T, cfg customDNSProviderConfig, err error) {
-				require.NoError(t, err)
-				assert.Equal(t, "infoblox.local", cfg.Host)
-				assert.Equal(t, "443", cfg.Port) // default
-			},
-		},
-		{
-			name: "config with all fields",
-			configJSON: `{
-				"host": "infoblox.local",
-				"port": "8443",
-				"version": "2.12",
-				"view": "External",
-				"sslVerify": true,
-				"httpRequestTimeout": 120,
-				"httpPoolConnections": 25,
-				"getUserFromVolume": true,
-				"ttl": 900,
-				"useTtl": false
-			}`,
-			validate: func(t *testing.T, cfg customDNSProviderConfig, err error) {
-				require.NoError(t, err)
-				assert.Equal(t, "infoblox.local", cfg.Host)
-				assert.Equal(t, "8443", cfg.Port)
-				assert.Equal(t, "2.12", cfg.Version)
-				assert.Equal(t, "External", cfg.View)
-				assert.True(t, cfg.SslVerify)
-				assert.Equal(t, 120, cfg.HTTPRequestTimeout)
-				assert.Equal(t, 25, cfg.HTTPPoolConnections)
-				assert.True(t, cfg.GetUserFromVolume)
-				assert.Equal(t, uint32(900), cfg.TTL)
-				assert.False(t, cfg.UseTTL)
-			},
-		},
-		{
-			name:       "config with zero values explicitly set",
-			configJSON: `{"host": "infoblox.local", "ttl": 0}`,
-			validate: func(t *testing.T, cfg customDNSProviderConfig, err error) {
-				require.NoError(t, err)
-				// Even though user set 0, default should apply
-				assert.Equal(t, uint32(300), cfg.TTL)
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			raw := apiextensionsv1.JSON{Raw: []byte(tt.configJSON)}
-			cfg, err := loadConfig(&raw)
-			tt.validate(t, cfg, err)
+func TestWAPIFailures(t *testing.T) {
+	for _, operation := range []string{"lookup", "create", "delete"} {
+		t.Run(operation, func(t *testing.T) {
+			solver, wapi := newTestSolver(t)
+			ch := challenge("private-value", "External")
+			var err error
+			switch operation {
+			case "lookup":
+				wapi.lookupStatus = http.StatusForbidden
+				err = solver.Present(ch)
+			case "create":
+				wapi.createStatus = http.StatusServiceUnavailable
+				err = solver.Present(ch)
+			case "delete":
+				require.NoError(t, solver.Present(ch))
+				wapi.deleteStatus = http.StatusForbidden
+				err = solver.CleanUp(ch)
+			}
+			require.Error(t, err)
+			assert.NotContains(t, err.Error(), "private-value")
 		})
 	}
+}
+
+func TestSharedCredentialAuthorizationAndRotation(t *testing.T) {
+	solver, wapi := newTestSolver(t)
+	ch := challenge("value", "External")
+	ch.AllowAmbientCredentials = false
+	require.ErrorContains(t, solver.Present(ch), "AllowAmbientCredentials")
+	require.ErrorContains(t, solver.CleanUp(ch), "AllowAmbientCredentials")
+	assert.Zero(t, wapi.creates)
+	ch.AllowAmbientCredentials = true
+	ch.ResourceNamespace = "application-a"
+	require.NoError(t, solver.Present(ch))
+	// A projected Secret update is picked up by the next operation, even in another namespace.
+	require.NoError(t, os.WriteFile(solver.settings.credentialsPath, []byte(`{"username":"user","password":"rotated"}`), 0o600))
+	wapi.password = "rotated"
+	ch.ResourceNamespace = "application-b"
+	require.NoError(t, solver.CleanUp(ch))
+	assert.Empty(t, wapi.records)
+}
+
+type errorConnector struct{ ibclient.IBConnector }
+
+func (*errorConnector) GetObject(_ ibclient.IBObject, _ string, _ *ibclient.QueryParams, result interface{}) error {
+	// A connector error must not be swallowed just because it also returned data.
+	*result.(*[]ibclient.RecordTXT) = []ibclient.RecordTXT{{Ref: "record:txt/1"}}
+	return fmt.Errorf("lookup failed")
+}
+
+func TestLookupDoesNotSwallowErrors(t *testing.T) {
+	solver := &customDNSProviderSolver{}
+	_, err := solver.GetTXTRecord(&errorConnector{}, "name", "value", "view")
+	require.ErrorContains(t, err, "lookup failed")
 }

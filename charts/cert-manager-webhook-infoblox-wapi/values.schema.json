@@ -1,5 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "Modified by the balex42 fork for shared credentials, internal CA trust, and non-root serving.",
   "type": "object",
   "title": "cert-manager-webhook-infoblox-wapi Helm Values",
   "description": "Values schema for the cert-manager-webhook-infoblox-wapi Helm chart",
@@ -67,11 +68,16 @@
         "repository": {
           "type": "string",
           "description": "Image repository",
-          "default": "ghcr.io/sarg3nt/cert-manager-webhook-infoblox-wapi"
+          "default": "ghcr.io/balex42/cert-manager-webhook-infoblox-wapi"
         },
         "tag": {
           "type": "string",
           "description": "Image tag (defaults to chart appVersion)"
+        },
+        "digest": {
+          "type": "string",
+          "pattern": "^$|^sha256:[a-f0-9]{64}$",
+          "description": "Immutable image digest; takes precedence over tag"
         },
         "pullPolicy": {
           "type": "string",
@@ -126,9 +132,9 @@
       "description": "Pod-level security context. Set to {} to disable. On OpenShift, omit runAsUser/runAsGroup/fsGroup/seccompProfile.",
       "default": {
         "runAsNonRoot": true,
-        "runAsUser": 65534,
-        "runAsGroup": 65534,
-        "fsGroup": 65534,
+        "runAsUser": 65532,
+        "runAsGroup": 65532,
+        "fsGroup": 65532,
         "seccompProfile": {
           "type": "RuntimeDefault"
         }
@@ -147,11 +153,54 @@
     },
     "secretVolume": {
       "type": "object",
-      "description": "Configuration for loading secrets from a host path",
+      "maxProperties": 0,
+      "description": "Removed: use infoblox.credentials.existingSecret instead"
+    },
+    "securePort": {
+      "type": "integer",
+      "minimum": 1024,
+      "maximum": 65535,
+      "default": 8443
+    },
+    "infoblox": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["host", "port", "version", "credentials", "tls", "httpRequestTimeout", "httpPoolConnections"],
       "properties": {
-        "hostPath": {
+        "host": {
           "type": "string",
-          "description": "Path on the host to mount for secrets"
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]*$"
+        },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "version": { "type": "string", "pattern": "^[0-9]+(\\.[0-9]+)+$" },
+        "httpRequestTimeout": { "type": "integer", "minimum": 1, "maximum": 3600 },
+        "httpPoolConnections": { "type": "integer", "minimum": 1, "maximum": 3600 },
+        "credentials": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["existingSecret", "key"],
+          "properties": {
+            "existingSecret": { "type": "string", "minLength": 1 },
+            "key": { "type": "string", "minLength": 1 }
+          }
+        },
+        "tls": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["verify", "caBundle"],
+          "properties": {
+            "verify": { "type": "boolean", "default": true },
+            "caBundle": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["existingConfigMap", "key"],
+              "properties": {
+                "existingConfigMap": { "type": "string" },
+                "key": { "type": "string", "minLength": 1 }
+              }
+            }
+          }
         }
       }
     },
@@ -171,7 +220,7 @@
         },
         "port": {
           "type": "integer",
-          "description": "HTTPS port for the webhook. Used both for the Service port and for the container's listening port (passed as --secure-port). Use a port >= 1024 on OpenShift.",
+          "description": "Service HTTPS port; the container listener uses securePort",
           "minimum": 1,
           "maximum": 65535,
           "default": 443
@@ -313,11 +362,19 @@
           "items": {
             "type": "object"
           }
+        },
+        "ingressPeers": {
+          "type": "array",
+          "items": { "type": "object" }
+        },
+        "dnsPeers": {
+          "type": "array",
+          "items": { "type": "object" }
         }
       }
     }
   },
   "required": [
-    "groupName"
+    "groupName", "infoblox", "securePort"
   ]
 }

@@ -1,3 +1,4 @@
+{{/* Modified by the balex42 fork: shared mounted credentials and DNS-only solver config. */}}
 🎉 {{ include "webhook.fullname" . }} has been successfully installed!
 
 📋 NEXT STEPS:
@@ -8,7 +9,7 @@
 2. Check the webhook logs:
    kubectl logs -n {{ .Release.Namespace }} -l app={{ include "webhook.name" . }}
 
-3. Create an Issuer or ClusterIssuer that uses this webhook. Example:
+3. Create a ClusterIssuer that uses this shared-account webhook. Example:
 
    apiVersion: cert-manager.io/v1
    kind: ClusterIssuer
@@ -26,23 +27,17 @@
              groupName: {{ .Values.groupName }}
              solverName: infoblox-wapi
              config:
-               host: your-infoblox-server.example.com
-               view: "Your DNS View"
-               usernameSecretRef:
-                 name: infoblox-credentials
-                 key: username
-               passwordSecretRef:
-                 name: infoblox-credentials
-                 key: password
+                view: "Your DNS View"
+                ttl: 300
+                useTtl: true
 
-4. Don't forget to create the Infoblox credentials secret:
-   kubectl create secret generic infoblox-credentials \
-     -n {{ .Release.Namespace }} \
-     --from-literal=username=YOUR_USERNAME \
-     --from-literal=password=YOUR_PASSWORD
+4. The existing credentials Secret must contain an ordinary JSON credentials file:
+   kubectl create secret generic {{ .Values.infoblox.credentials.existingSecret }} \
+      -n {{ .Release.Namespace }} \
+      --from-file={{ .Values.infoblox.credentials.key }}=/secure/path/creds.json
 
 📚 For more information, visit:
-   https://github.com/sarg3nt/cert-manager-webhook-infoblox-wapi
+   https://github.com/balex42/cert-manager-webhook-infoblox-wapi
 
 ⚙️  Configuration:
    - Group Name: {{ .Values.groupName }}

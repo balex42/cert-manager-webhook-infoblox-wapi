@@ -1,3 +1,7 @@
+{{- if and .Values.infoblox.tls.caBundle.existingConfigMap (not .Values.infoblox.tls.verify) }}
+{{- fail "infoblox.tls.caBundle requires infoblox.tls.verify=true" }}
+{{- end }}
+# Modified by the balex42 fork: shared Secret and CA mounts, non-root listener.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -35,7 +39,11 @@ spec:
       {{- end }}
       containers:
         - name: {{ .Chart.Name }}
+          {{- if .Values.image.digest }}
+          image: "{{ .Values.image.repository }}@{{ .Values.image.digest }}"
+          {{- else }}
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          {{- end }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           {{- with .Values.containerSecurityContext }}
           securityContext:
@@ -44,13 +52,29 @@ spec:
           args:
             - --tls-cert-file=/tls/tls.crt
             - --tls-private-key-file=/tls/tls.key
-            - --secure-port={{ .Values.service.port }}
+            - --secure-port={{ .Values.securePort }}
           env:
             - name: GROUP_NAME
               value: {{ .Values.groupName | quote }}
+            - name: INFOBLOX_HOST
+              value: {{ required "infoblox.host is required" .Values.infoblox.host | quote }}
+            - name: INFOBLOX_PORT
+              value: {{ .Values.infoblox.port | quote }}
+            - name: INFOBLOX_VERSION
+              value: {{ .Values.infoblox.version | quote }}
+            - name: INFOBLOX_HTTP_TIMEOUT
+              value: {{ .Values.infoblox.httpRequestTimeout | quote }}
+            - name: INFOBLOX_HTTP_POOL_CONNECTIONS
+              value: {{ .Values.infoblox.httpPoolConnections | quote }}
+            - name: INFOBLOX_TLS_VERIFY
+              value: {{ .Values.infoblox.tls.verify | quote }}
+            {{- if .Values.infoblox.tls.caBundle.existingConfigMap }}
+            - name: INFOBLOX_CA_FILE
+              value: /etc/infoblox-ca/ca.crt
+            {{- end }}
           ports:
             - name: https
-              containerPort: {{ .Values.service.port }}
+              containerPort: {{ .Values.securePort }}
               protocol: TCP
           livenessProbe:
             httpGet:
@@ -83,19 +107,31 @@ spec:
             - name: certs
               mountPath: /tls
               readOnly: true
-            {{- if .Values.secretVolume.hostPath }}
-            - name: secret-volume
-              mountPath: /etc/secrets/creds.json
+            - name: credentials
+              mountPath: /etc/secrets
+              readOnly: true
+            {{- if .Values.infoblox.tls.caBundle.existingConfigMap }}
+            - name: infoblox-ca
+              mountPath: /etc/infoblox-ca
               readOnly: true
             {{- end }}
           resources:
 {{ toYaml .Values.resources | indent 12 }}
       volumes:
-        {{- if .Values.secretVolume.hostPath }}
-        - name: secret-volume
-          hostPath:
-            path: {{ .Values.secretVolume.hostPath }}
-            type: FileOrCreate
+        - name: credentials
+          secret:
+            secretName: {{ .Values.infoblox.credentials.existingSecret | quote }}
+            defaultMode: 0440
+            items:
+              - key: {{ .Values.infoblox.credentials.key | quote }}
+                path: creds.json
+        {{- if .Values.infoblox.tls.caBundle.existingConfigMap }}
+        - name: infoblox-ca
+          configMap:
+            name: {{ .Values.infoblox.tls.caBundle.existingConfigMap | quote }}
+            items:
+              - key: {{ .Values.infoblox.tls.caBundle.key | quote }}
+                path: ca.crt
         {{- end }}
         - name: certs
           secret:

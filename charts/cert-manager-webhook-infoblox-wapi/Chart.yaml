@@ -1,3 +1,4 @@
+# Modified by the balex42 fork; upstream provenance is retained in sources and NOTICE.
 apiVersion: v2
 name: cert-manager-webhook-infoblox-wapi
 type: application
@@ -7,7 +8,9 @@ type: application
 version: 3.0.6 # x-release-please-version
 appVersion: 3.0.6 # x-release-please-version
 description: Cert-manager webhook for interacting with InfoBlox WAPI servers
-home: https://github.com/sarg3nt/cert-manager-webhook-infoblox-wapi
+home: https://github.com/balex42/cert-manager-webhook-infoblox-wapi
+annotations:
+  org.opencontainers.image.source: https://github.com/balex42/cert-manager-webhook-infoblox-wapi
 keywords:
   - cert-manager
   - webhook
@@ -16,7 +19,8 @@ keywords:
   - dns01
   - infoblox
 sources:
+  - https://github.com/balex42/cert-manager-webhook-infoblox-wapi
   - https://github.com/sarg3nt/cert-manager-webhook-infoblox-wapi
 maintainers:
-  - name: Dave Sargent
-    email: dave@sarg3.net
+  - name: balex42
+    url: https://github.com/balex42

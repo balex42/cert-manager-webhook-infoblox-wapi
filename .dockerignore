@@ -1,0 +1,10 @@
+.git
+.devcontainer
+.vscode
+bin
+_out
+_test
+webhook
+coverage.out
+testdata/infoblox-wapi/config.json
+testdata/infoblox-wapi/credentials.yaml

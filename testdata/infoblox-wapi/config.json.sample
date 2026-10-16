@@ -1,12 +1,5 @@
 {
-  "host": "",
-  "view": "",
-  "usernameSecretRef": {
-    "name": "infoblox-credentials",
-    "key": "username"
-  },
-  "passwordSecretRef": {
-    "name": "infoblox-credentials",
-    "key": "password"
-  }
+  "view": "External",
+  "ttl": 300,
+  "useTtl": true
 }

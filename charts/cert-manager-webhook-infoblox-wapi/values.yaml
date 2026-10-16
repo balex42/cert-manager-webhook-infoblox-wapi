@@ -1,3 +1,4 @@
+# Modified by the balex42 fork for shared credentials and verified WAPI TLS.
 # cspell:ignore mycompany
 # The GroupName here is used to identify your company or business unit that
 # created this webhook.
@@ -20,9 +21,11 @@ servingCertificate:
   duration: "8760h"
 
 image:
-  repository: ghcr.io/sarg3nt/cert-manager-webhook-infoblox-wapi
+  repository: ghcr.io/balex42/cert-manager-webhook-infoblox-wapi
   # Override the image tag whose default is the chart appVersion.
   tag: ""
+  # When set, digest takes precedence over tag.
+  digest: ""
   pullPolicy: IfNotPresent
 
 # Optionally specify image pull secrets for private registries
@@ -49,9 +52,9 @@ podAnnotations: {}
 #   podSecurityContext: null
 podSecurityContext:
   runAsNonRoot: true
-  runAsUser: 65534
-  runAsGroup: 65534
-  fsGroup: 65534
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
   seccompProfile:
     type: RuntimeDefault
 
@@ -67,17 +70,28 @@ containerSecurityContext:
     drop:
       - ALL
 
-# Used if loading the secret from a file on disk.
-secretVolume:
-  hostPath: ""
-  # hostPath: /etc/secrets/secrets.json
+# Shared-account settings are controlled by the deployment, never by an Issuer.
+infoblox:
+  host: "" # Required: WAPI hostname (without scheme, port, or path).
+  port: 443
+  version: "2.10"
+  httpRequestTimeout: 60
+  httpPoolConnections: 10
+  credentials:
+    existingSecret: infoblox-credentials
+    key: creds.json
+  tls:
+    verify: true
+    caBundle:
+      # Optional PEM bundle added to system trust. Must be in the release namespace.
+      existingConfigMap: ""
+      key: ca.crt
+
+securePort: 8443
 
 service:
   type: ClusterIP
-  # HTTPS port for the webhook. Used both for the Service port and for the
-  # container's listening port (passed to the webhook as --secure-port).
-  # On OpenShift the pod usually cannot bind privileged ports (< 1024),
-  # so set a port >= 1024 there (e.g. 8443).
+  # Service port; the non-privileged container listener uses securePort.
   port: 443
   # Annotations to add to the service
   annotations: {}
@@ -126,6 +140,18 @@ serviceMonitor:
 # NetworkPolicy to restrict egress traffic
 networkPolicy:
   enabled: false
+  # Required when enabled: control-plane peers that connect to the aggregated API.
+  # Use ipBlock entries for host-network/external API servers as appropriate for your CNI.
+  ingressPeers: []
+  dnsPeers:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+  # Required when enabled: explicit rules for WAPI and Kubernetes API endpoints.
+  egressRules: []
   # egressRules:
   #   - to:
   #       - ipBlock:

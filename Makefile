@@ -1,9 +1,10 @@
+# Modified by the balex42 fork: local WAPI tests and fork image defaults.
 # cspell:ignore KUBEBUILDER
 GO ?= $(shell which go)
 OS ?= $(shell $(GO) env GOOS)
 ARCH ?= $(shell $(GO) env GOARCH)
 
-IMAGE_NAME := ghcr.io/sarg3nt/cert-manager-webhook-infoblox-wapi
+IMAGE_NAME := ghcr.io/balex42/cert-manager-webhook-infoblox-wapi
 # IMAGE_TAG is derived from Chart.yaml appVersion if not set
 IMAGE_TAG ?= $(shell grep '^appVersion:' charts/cert-manager-webhook-infoblox-wapi/Chart.yaml | cut -d' ' -f2)
 GIT_BRANCH := $(shell git rev-parse --abbrev-ref HEAD | sed 's/[\/_]/-/g')
@@ -29,28 +30,24 @@ $(SETUP_ENVTEST): | bin
 	GOBIN=$(shell pwd)/bin $(GO) install sigs.k8s.io/controller-runtime/tools/setup-envtest@latest
 
 .PHONY: test
-test: setup-envtest ## Run unit tests
-	@KUBEBUILDER_ASSETS_PATH="$(shell $(SETUP_ENVTEST) use $(ENVTEST_K8S_VERSION) -p path)" && \
-	TEST_ASSET_ETCD="$$KUBEBUILDER_ASSETS_PATH/etcd" \
-	TEST_ASSET_KUBE_APISERVER="$$KUBEBUILDER_ASSETS_PATH/kube-apiserver" \
-	TEST_ASSET_KUBECTL="$$KUBEBUILDER_ASSETS_PATH/kubectl" \
-	$(GO) test -v .
+test: ## Run unit and local HTTPS WAPI tests (no cluster required)
+	$(GO) test -mod=readonly -v ./...
 
 .PHONY: test-coverage
-test-coverage: setup-envtest ## Run tests with coverage report
-	@KUBEBUILDER_ASSETS_PATH="$(shell $(SETUP_ENVTEST) use $(ENVTEST_K8S_VERSION) -p path)" && \
-	TEST_ASSET_ETCD="$$KUBEBUILDER_ASSETS_PATH/etcd" \
-	TEST_ASSET_KUBE_APISERVER="$$KUBEBUILDER_ASSETS_PATH/kube-apiserver" \
-	TEST_ASSET_KUBECTL="$$KUBEBUILDER_ASSETS_PATH/kubectl" \
-	$(GO) test -coverprofile=coverage.out -covermode=atomic .
+test-coverage: ## Run tests with coverage report
+	$(GO) test -mod=readonly -coverprofile=coverage.out -covermode=atomic ./...
 
 .PHONY: test-race
-test-race: setup-envtest ## Run tests with race detector
+test-race: ## Run tests with race detector
+	$(GO) test -mod=readonly -race ./...
+
+.PHONY: test-integration
+test-integration: setup-envtest ## Run conformance tests against a configured live Infoblox environment
 	@KUBEBUILDER_ASSETS_PATH="$(shell $(SETUP_ENVTEST) use $(ENVTEST_K8S_VERSION) -p path)" && \
 	TEST_ASSET_ETCD="$$KUBEBUILDER_ASSETS_PATH/etcd" \
 	TEST_ASSET_KUBE_APISERVER="$$KUBEBUILDER_ASSETS_PATH/kube-apiserver" \
 	TEST_ASSET_KUBECTL="$$KUBEBUILDER_ASSETS_PATH/kubectl" \
-	$(GO) test -race -v .
+	$(GO) test -mod=readonly -tags=integration -run TestRunsSuite -v .
 
 .PHONY: clean
 clean: ## Clean build artifacts and test files
@@ -58,12 +55,10 @@ clean: ## Clean build artifacts and test files
 
 .PHONY: build
 build: ## Build the webhook binary
-	go mod tidy
-	CGO_ENABLED=0 go build -o webhook -ldflags '-w -extldflags "-static"' .
+	CGO_ENABLED=0 $(GO) build -mod=readonly -trimpath -o webhook -ldflags '-s -w' .
 
 .PHONY: build-container
 build-container: ## Build the Docker container image
-	go mod tidy
 	docker build -t "$(IMAGE_NAME):$(IMAGE_TAG)-$(GIT_BRANCH)" .
 
 .PHONY: push-container
@@ -78,6 +73,7 @@ $(OUT)/rendered-manifest.yaml: $(HELM_FILES) | $(OUT)
 		cert-manager-webhook-infoblox-wapi \
 		--set image.repository=$(IMAGE_NAME) \
 		--set image.tag=$(IMAGE_TAG) \
+		--set infoblox.host=$(INFOBLOX_HOST) \
 		charts/cert-manager-webhook-infoblox-wapi > $@
 
 _test $(OUT) bin:

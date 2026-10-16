@@ -1,10 +1,2 @@
-* @sarg3nt
-/.devcontainer/ @brycefors @Stanrofl @aidanleuck @ibfleming
-/charts/ @brycefors @Stanrofl @aidanleuck @ibfleming
-/.github/CODEOWNERS @brycefors @Stanrofl @aidanleuck @ibfleming
-/.github/dependabot.yml @brycefors @Stanrofl @aidanleuck @ibfleming
-/testdata/ @brycefors @Stanrofl @aidanleuck @ibfleming
-*.sh @brycefors @Stanrofl @aidanleuck @ibfleming
-*.md @brycefors @Stanrofl @aidanleuck @ibfleming
-*.go @brycefors @Stanrofl @aidanleuck @ibfleming
-/Makefile @brycefors @Stanrofl @aidanleuck @ibfleming
+# Modified for the balex42 fork.
+* @balex42
